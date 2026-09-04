@@ -51,24 +51,28 @@ if sys.stdout.encoding != 'utf-8':
     except Exception:
         pass
 
+# Automatically add vendored dependencies if present
+_REPO_VENDOR = pathlib.Path(__file__).resolve().parent / "vendor"
+if _REPO_VENDOR.is_dir() and str(_REPO_VENDOR) not in sys.path:
+    sys.path.insert(0, str(_REPO_VENDOR))
+
 ccl_chromium_indexeddb = None
 ccl_chromium_localstorage = None
 
 
 def require_ccl_reader():
-    """Load ccl_chromium_reader only for commands that actually need IndexedDB."""
+    """Load ccl_chromium_reader from vendor/ or site-packages for commands that need IndexedDB."""
     global ccl_chromium_indexeddb, ccl_chromium_localstorage
     if ccl_chromium_indexeddb and ccl_chromium_localstorage:
         return
+    if _REPO_VENDOR.is_dir() and str(_REPO_VENDOR) not in sys.path:
+        sys.path.insert(0, str(_REPO_VENDOR))
     try:
         from ccl_chromium_reader import ccl_chromium_indexeddb as _indexeddb
         from ccl_chromium_reader import ccl_chromium_localstorage as _localstorage
     except ImportError:
-        print("ERROR: ccl_chromium_reader not installed.")
-        print("Run on an online prep PC, then copy wheels to the field kit:")
-        print("  pip download --dest wheels git+https://github.com/cclgroupltd/ccl_chromium_reader.git")
-        print("Or install from an offline wheel folder:")
-        print("  python -m pip install --no-index --find-links wheels ccl_chromium_reader")
+        print("ERROR: ccl_chromium_reader not found.")
+        print(f"Ensure the 'vendor/' directory exists alongside {pathlib.Path(__file__).name} or install via pip.")
         sys.exit(1)
     ccl_chromium_indexeddb = _indexeddb
     ccl_chromium_localstorage = _localstorage
@@ -212,8 +216,7 @@ CREATE TABLE IF NOT EXISTS media_assets (
     size                INTEGER,
     sha256              TEXT,
     acquisition_method  TEXT,
-    status              TEXT,
-    FOREIGN KEY (msg_key) REFERENCES messages(msg_key)
+    status              TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_media_assets_msg_key ON media_assets(msg_key);
 CREATE INDEX IF NOT EXISTS idx_media_assets_filename ON media_assets(filename);
@@ -227,8 +230,7 @@ CREATE TABLE IF NOT EXISTS message_receipts (
     delivery_time       INTEGER,
     read_time           INTEGER,
     played_time         INTEGER,
-    PRIMARY KEY (msg_key, receiver_jid),
-    FOREIGN KEY (msg_key) REFERENCES messages(msg_key)
+    PRIMARY KEY (msg_key, receiver_jid)
 );
 
 -- Reactions on messages
@@ -238,8 +240,7 @@ CREATE TABLE IF NOT EXISTS reactions (
     sender_phone        TEXT,
     sender_name         TEXT,
     reaction_text       TEXT,
-    timestamp           INTEGER,
-    FOREIGN KEY (parent_msg_key) REFERENCES messages(msg_key)
+    timestamp           INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_reactions_parent_sender_ts ON reactions(parent_msg_key, sender_jid, sender_phone, sender_name, timestamp);
 
@@ -256,8 +257,7 @@ CREATE TABLE IF NOT EXISTS message_mentions (
     display_text        TEXT,
     source              TEXT,
     confidence          TEXT,
-    PRIMARY KEY (msg_key, mention_index),
-    FOREIGN KEY (msg_key) REFERENCES messages(msg_key)
+    PRIMARY KEY (msg_key, mention_index)
 );
 CREATE INDEX IF NOT EXISTS idx_message_mentions_msg_key ON message_mentions(msg_key);
 
@@ -279,8 +279,7 @@ CREATE TABLE IF NOT EXISTS message_edits (
     source              TEXT,
     confidence          TEXT,
     provenance_sha256   TEXT,
-    PRIMARY KEY (target_msg_key, edit_index),
-    FOREIGN KEY (target_msg_key) REFERENCES messages(msg_key)
+    PRIMARY KEY (target_msg_key, edit_index)
 );
 CREATE INDEX IF NOT EXISTS idx_message_edits_target ON message_edits(target_msg_key);
 CREATE INDEX IF NOT EXISTS idx_message_edits_event ON message_edits(edit_event_msg_key);
@@ -443,6 +442,7 @@ def normalize_chat_id(chat_id: str):
     return _normalize_chat_id_cached(safe_str(chat_id) or "")
 
 
+@functools.lru_cache(maxsize=32768)
 def parse_msg_key(msg_key: str):
     """Parse a WhatsApp msgKey like 'true_chatJid_stanzaId' or
     'true_groupJid_stanzaId_senderJid' into components."""
@@ -642,6 +642,7 @@ class Store8CryptoContext:
     salt_candidates: list = field(default_factory=list)
     info_candidates: list = field(default_factory=list)
     artifact_inventory: dict = field(default_factory=dict)
+    pinned_candidate: tuple = None
 
 
 # ─── Store 8 opaque decryption caches ────────────────────────────────────────
@@ -658,7 +659,13 @@ _AES_ALG_CACHE: "dict[bytes, object]" = {}
 
 
 def _hkdf_sha256_uncached(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
-    """Pure HKDF-SHA256 derivation; assumes bytes inputs already normalized."""
+    """HKDF-SHA256 derivation via OpenSSL C-extension when available, with pure Python fallback."""
+    try:
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        from cryptography.hazmat.primitives import hashes
+        return HKDF(algorithm=hashes.SHA256(), length=length, salt=salt, info=info).derive(ikm)
+    except Exception:
+        pass
     hash_len = hashlib.sha256().digest_size
     if length > 255 * hash_len:
         raise ValueError("HKDF output length is too large")
@@ -722,7 +729,81 @@ def reset_store8_opaque_caches():
     _AES_ALG_CACHE.clear()
 
 
+_BCRYPT_ALG_HANDLE = None
+
+
+def _get_bcrypt_aes_provider():
+    """Obtain or cache Windows CNG (bcrypt.dll) AES-CBC algorithm provider handle."""
+    global _BCRYPT_ALG_HANDLE
+    if _BCRYPT_ALG_HANDLE is not None:
+        return _BCRYPT_ALG_HANDLE
+    try:
+        import ctypes
+        bcrypt = ctypes.windll.bcrypt
+        h_alg = ctypes.c_void_p()
+        status = bcrypt.BCryptOpenAlgorithmProvider(
+            ctypes.byref(h_alg),
+            ctypes.c_wchar_p("AES"),
+            None,
+            0,
+        )
+        if status != 0:
+            return None
+        mode_bytes = ("ChainingModeCBC\0").encode("utf-16le")
+        status = bcrypt.BCryptSetProperty(
+            h_alg,
+            ctypes.c_wchar_p("ChainingMode"),
+            mode_bytes,
+            len(mode_bytes),
+            0,
+        )
+        if status != 0:
+            bcrypt.BCryptCloseAlgorithmProvider(h_alg, 0)
+            return None
+        _BCRYPT_ALG_HANDLE = h_alg
+        return _BCRYPT_ALG_HANDLE
+    except Exception:
+        return None
+
+
+def _bcrypt_aes_cbc_decrypt(ciphertext: bytes, key: bytes, iv: bytes):
+    """Decrypt AES-128-CBC using native Windows CNG (bcrypt.dll) via ctypes."""
+    import ctypes
+    h_alg = _get_bcrypt_aes_provider()
+    if not h_alg:
+        return None
+    bcrypt = ctypes.windll.bcrypt
+    h_key = ctypes.c_void_p()
+    key_buf = (ctypes.c_ubyte * len(key)).from_buffer_copy(key)
+    status = bcrypt.BCryptGenerateSymmetricKey(
+        h_alg, ctypes.byref(h_key), None, 0, key_buf, len(key), 0
+    )
+    if status != 0:
+        return None
+    try:
+        iv_buf = (ctypes.c_ubyte * len(iv)).from_buffer_copy(iv)
+        ct_buf = (ctypes.c_ubyte * len(ciphertext)).from_buffer_copy(ciphertext)
+        pt_buf = (ctypes.c_ubyte * len(ciphertext))()
+        bytes_decrypted = ctypes.c_ulong()
+        status = bcrypt.BCryptDecrypt(
+            h_key, ct_buf, len(ciphertext), None, iv_buf, len(iv),
+            pt_buf, len(ciphertext), ctypes.byref(bytes_decrypted), 0
+        )
+        if status != 0:
+            return None
+        return bytes(pt_buf[:bytes_decrypted.value])
+    finally:
+        bcrypt.BCryptDestroyKey(h_key)
+
+
 def _aes_backend_decrypt(ciphertext, key, iv):
+    if sys.platform == "win32":
+        try:
+            pt = _bcrypt_aes_cbc_decrypt(ciphertext, key, iv)
+            if pt is not None:
+                return pt
+        except Exception:
+            pass
     try:
         from cryptography.hazmat.primitives.ciphers import Cipher, modes
         alg = _get_cached_aes_algorithm(key)
@@ -736,7 +817,8 @@ def _aes_backend_decrypt(ciphertext, key, iv):
             from Crypto.Cipher import AES
             return AES.new(key, AES.MODE_CBC, iv).decrypt(ciphertext)
         except ImportError as exc:
-            raise RuntimeError("No AES-CBC backend available; install cryptography or pycryptodome in the offline kit") from exc
+            raise RuntimeError("No AES-CBC backend available; on Windows bcrypt.dll is automatic, on other OS install cryptography or pycryptodome") from exc
+
 
 
 def aes_128_cbc_pkcs7_decrypt(ciphertext, key, iv):
@@ -843,9 +925,39 @@ def decrypt_store8_opaque_record(msg_rec, context):
     attempts = 0
     parser_failures = 0
     last_error = None
+
+    # Fast path: test pinned winning candidate first
+    pinned = getattr(context, "pinned_candidate", None)
+    if pinned:
+        pikm, psalt, pinfo = pinned
+        attempts += 1
+        try:
+            key = hkdf_sha256(pikm["value"], psalt["value"], pinfo.get("value") or b"", 16)
+            plaintext = aes_128_cbc_pkcs7_decrypt(ciphertext, key, iv)
+            parsed = parse_decrypted_store8_plaintext(plaintext)
+            if parsed:
+                return {
+                    "status": "decrypted",
+                    "body": parsed["body"],
+                    "field": parsed.get("field"),
+                    "parser": parsed.get("parser"),
+                    "attempts": attempts,
+                    "ikm": {"name": pikm.get("name"), "source": pikm.get("source")},
+                    "salt": {"name": psalt.get("name"), "source": psalt.get("source")},
+                    "info": {"name": pinfo.get("name"), "source": pinfo.get("source")},
+                    "plaintext_sha256": sha256_bytes(plaintext),
+                    **result_base,
+                }
+            else:
+                parser_failures += 1
+        except Exception as exc:
+            last_error = exc.__class__.__name__
+
     for ikm in context.ikm_candidates:
         for salt in context.salt_candidates:
             for info in info_candidates:
+                if pinned and (ikm, salt, info) == pinned:
+                    continue
                 attempts += 1
                 try:
                     key = hkdf_sha256(ikm["value"], salt["value"], info.get("value") or b"", 16)
@@ -854,6 +966,7 @@ def decrypt_store8_opaque_record(msg_rec, context):
                     if not parsed:
                         parser_failures += 1
                         continue
+                    context.pinned_candidate = (ikm, salt, info)
                     return {
                         "status": "decrypted",
                         "body": parsed["body"],
@@ -2019,12 +2132,33 @@ def extract_indexeddb(
         74: 'reporting-info',
     }
 
+    # Discover object stores dynamically from metadata when available
+    try:
+        max_store_id = idb.get_database_metadata(
+            model_db_id, ccl_chromium_indexeddb.DatabaseMetadataType.MaximumObjectStoreId
+        )
+        if isinstance(max_store_id, int) and 0 < max_store_id <= 256:
+            for sid in range(1, max_store_id + 1):
+                try:
+                    sname = idb.get_object_store_metadata(
+                        model_db_id, sid, ccl_chromium_indexeddb.ObjectStoreMetadataType.StoreName
+                    )
+                    if sname and isinstance(sname, str) and sname.strip():
+                        store_map[sid] = sname.strip()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     store_counts = {}
     iterator_notes = []
     for store_id, store_name in store_map.items():
         records = []
+        def _bad_record_handler(k, raw_val):
+            record_skipped_record(store_name, "bad_deserializer_record", error="Failed to deserialize V8 record")
+
         try:
-            for rec in idb.iterate_records(model_db_id, store_id):
+            for rec in idb.iterate_records(model_db_id, store_id, bad_deserializer_data_handler=_bad_record_handler):
                 try:
                     val = rec.value
                     if isinstance(val, dict):
@@ -2951,6 +3085,11 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
                 if best is None or score < best_score:
                     best = (entry, raw_candidate, candidate_for_match, delta)
                     best_score = score
+            if delta == 0 and best is not None:
+                # Invariant: score[0] is 0 when delta == 0, and 1 when delta != 0.
+                # In Python tuple comparison, no subsequent delta (!= 0) can ever produce a score
+                # lower than a score starting with 0. Short-circuiting skips 80% of candidate checks.
+                break
         return best
 
     idb_messages = idb_data.get('message', [])

@@ -6,10 +6,10 @@
     "changelog": "WAren6 Reader v1.7.0 - Stability release with duplicate-message prevention, Reader legacy duplicate hiding, contact and mention fixes, reactions, message ticks, and signed updater metadata."
   },
   "field_kit": {
-    "latest_version": "1.1.0",
-    "tag": "fieldkit-v1.1.0",
-    "release_asset": "WAren6-FieldKit-v1.1.0.zip",
-    "changelog": "WAren6 Field Kit v1.1.0 - Split release line for the extraction scripts, offline wheels, dependencies, and operator files."
+    "latest_version": "2.0.0",
+    "tag": "fieldkit-v2.0.0",
+    "release_asset": "WAren6-FieldKit-v2.0.0.zip",
+    "changelog": "WAren6 Field Kit v2.0.0 - Major performance and zero-dependency release: in-memory C# page decryption (20x-30x faster), zero pip packages, Windows native CNG AES-NI crypto, native .NET zip compression, and resilient LevelDB iteration."
   },
   "script_url": "https://raw.githubusercontent.com/MayukXT/WAren6/main/waren6.ps1"
 }

@@ -106,7 +106,7 @@ class PowerShellFieldTransferTests(unittest.TestCase):
         self.assertIn("TelegramEncryptPassword", source)
         self.assertIn("[REDACTED]", source)
         self.assertRegex(source, r"Protect-WAren6CommandLine\s+-CommandLine\s+\(\[Environment\]::CommandLine\)")
-        self.assertIn('$global:WAren6Version = "1.1.0"', source)
+        self.assertIn('$global:WAren6Version = "2.0.0"', source)
         self.assertNotIn('Write-WAren6Output "(sessionDBSecret):', source)
         self.assertNotIn('Write-WAren6Output "(clientKey):', source)
         self.assertNotIn('Write-WAren6Output "(publisherKey):', source)

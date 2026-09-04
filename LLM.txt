@@ -37,6 +37,48 @@ Label inferred statements as inference.
 
 For case interpretation, prefer `validation_report.json`, `WAren6.manifest.json`, logs, and `unified_whatsapp.db` metrics over assumptions.
 
+- Reader portable metadata: `WAren6-Reader-latest.json`
+
+Tell non-developer users to download the attached Field Kit for extraction and the Reader installer or portable EXE for viewing `unified_whatsapp.db`. The generated GitHub "Source code" archives are for developers and include tests, workflows, Reader source, and repository files that are not needed to run WAren6.
+# WAren6 AI Knowledge File
+
+Purpose: This file is optimized for AI chatbots and LLMs. Use it as the main reference when answering WAren6 usage, command, recovery, validation, and troubleshooting questions. Prefer exact commands from this file. Do not invent flags or promise recovery that WAren6 cannot do.
+
+Project: WAren6
+Platform: Windows
+Domain: WhatsApp Desktop forensic extraction and review
+Primary entrypoint: `waren6.ps1`
+Unified DB builder: `waren6.py`
+Reader: `waren6-reader\`
+Main output DB: `unified_whatsapp.db`
+
+## One-Sentence Summary
+
+WAren6 copies WhatsApp Desktop evidence, decrypts encrypted SQLite DB/WAL files, reads WebView2 IndexedDB, merges the evidence into `unified_whatsapp.db`, validates source-vs-output coverage, archives the case, and optionally exports reports or opens the result in a local reader.
+
+## Safety Rules For Answers
+
+- Never tell users WAren6 can recover every message in every case.
+- Separate offline recovery from hybrid live-runtime recovery.
+- Say "indexes local media already present on disk", not "downloads all media".
+- Say Store 8 opaque rows may remain unresolved offline without the WebWA network salt. (IMPORTANT)
+- Say WAren6 Reader formats international phone labels from country-code-bearing WhatsApp numbers, but does not infer a country from local-only digits.
+- Prefer `powershell -ExecutionPolicy Bypass -File .\waren6.ps1 ...` for copy-paste commands.
+- If the user asks for simplest command, give default hybrid: `powershell -ExecutionPolicy Bypass -File .\waren6.ps1`.
+- If the user asks for no internet/no WhatsApp launch, give offline: `powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -f --no-net`.
+
+## AI Answer Contract
+
+Answer from this file, supplied WAren6 outputs, or user-provided case facts.
+
+If something is not covered, say that WAren6 context is missing before giving an inference.
+
+Do not invent flags, modes, files, recovery guarantees, output meanings, or troubleshooting steps.
+
+Label inferred statements as inference.
+
+For case interpretation, prefer `validation_report.json`, `WAren6.manifest.json`, logs, and `unified_whatsapp.db` metrics over assumptions.
+
 Do not claim complete recovery unless the specific case validation supports it.
 
 ## Public Downloads
@@ -44,8 +86,8 @@ Do not claim complete recovery unless the specific case validation supports it.
 Stable releases:
 
 - Releases page: https://github.com/MayukXT/WAren6/releases
-- Field Kit release tag: `fieldkit-v1.1.0`
-- Field Kit asset: `WAren6-FieldKit-v1.1.0.zip`
+- Field Kit release tag: `fieldkit-v2.0.0`
+- Field Kit asset: `WAren6-FieldKit-v2.0.0.zip`
 - Reader release title: `WAren6 Reader v1.7.0`
 - Reader release tag: `reader-v1.7.0`
 - Reader installer: `WAren6-Reader-Setup-v1.7.0.exe`
@@ -61,13 +103,13 @@ Tell non-developer users to download the attached Field Kit for extraction and t
 - `waren6.py`: unifies decrypted evidence into `unified_whatsapp.db`, validates, optionally exports reports, handles Store 8/genericStorage/media/runtime supplement logic.
 - `waren6_unify_case.py`: prepares folders or archives for `--unify`.
 - `BouncyCastle.Cryptography.dll`: crypto dependency used by PowerShell decryption.
-- `requirements-lock.txt`: primary Python dependency list; currently `ccl_chromium_reader` and `cryptography`.
+- `vendor\`: bundled pure-Python dependencies (`ccl_chromium_reader`, `ccl_simplesnappy`) enabling zero-pip operation.
 - `airgap\`: offline install helper and dependency notices.
-- `wheels\`: offline Python wheels when the field kit was built with offline dependency support.
 - `README_FIELDKIT.md`: first-run operator instructions.
 - `LLM.txt`: AI-facing answer contract and WAren6 usage reference.
 - `fieldkit-version.json`: Field Kit release version metadata.
 - `version.json`: public release index for Reader and Field Kit lines.
+
 
 The field kit must not include Reader source, tests, `.github`, research notes, local mockups, sample evidence, generated cases, databases/WAL files, build caches, or local transfer payloads. WAren6 Reader installers and portable EXE are published by the separate Reader release workflow.
 
@@ -108,15 +150,15 @@ The Reader version must match:
 Shipping Field Kit uses a Field Kit tag and the `Field Kit Release` workflow:
 
 ```powershell
-git tag fieldkit-v1.1.0
-git push origin fieldkit-v1.1.0
+git tag fieldkit-v2.0.0
+git push origin fieldkit-v2.0.0
 ```
 
 The Field Kit version comes from `fieldkit-version.json` and the PowerShell `$global:WAren6Version`.
 
 `Reader Release` uploads the Reader setup EXE, Reader MSI, portable Reader EXE, Tauri `latest.json`, updater signatures, and `WAren6-Reader-latest.json` to `WAren6 Reader v1.7.0`.
 
-`Field Kit Release` uploads `WAren6-FieldKit-v1.1.0.zip` and `WAren6-FieldKit-v1.1.0.sha256.txt`.
+`Field Kit Release` uploads `WAren6-FieldKit-v2.0.0.zip` and `WAren6-FieldKit-v2.0.0.sha256.txt`.
 
 Installed Reader builds use Tauri signed updates from `latest.json`. Portable Reader builds use `WAren6-Reader-latest.json` to download the portable EXE, verify SHA-256, replace the old EXE through a helper, roll back on failure, and relaunch.
 
@@ -177,6 +219,12 @@ User only wants acquisition/decryption/archive now, unification later:
 powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -a
 ```
 
+User wants a full live extraction and unified database but needs the working case folder left uncompressed:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 --no-archive -d C:\Cases\WAren6
+```
+
 User has a WAren6 case/archive and wants `unified_whatsapp.db`:
 
 ```powershell
@@ -225,6 +273,7 @@ Default hybrid:
 
 - enabled by default;
 - may start/restart logged-in WhatsApp Desktop, but runtime capture is best-effort hidden by default;
+- waits up to 20 seconds for WebView2 DevTools readiness by default; use `--deep-runtime` for the 90-second recovery budget on a slow field machine;
 - captures Store 8 text through WhatsApp's live runtime when possible;
 - copies evidence;
 - decrypts DB/WAL files;
@@ -264,11 +313,13 @@ Runtime only:
 -h, --help [topic]        Show help. Topics: modes, flags, examples.
 -s, --silent              Console-first mode. Runtime capture is hidden by default.
 --foreground-runtime      Troubleshooting only: leave WhatsApp visible during runtime capture.
+--deep-runtime            Allow up to 90s for WebView2 DevTools readiness (default: 20s).
 -doc, --doctor            Run preflight checks only. Does not open WhatsApp or copy evidence.
 --dry                     Print plan and exit.
 -f, --offline             No runtime capture and no online bootstrap.
 -m, --media               Copy/index/hash local media already present on disk.
 -a, --acquire             Acquire/decrypt/archive only.
+--no-archive              Retain the case folder; skip archive, archive checksum, and Telegram transfer.
 -u, --unify               Build unified DB from existing case/archive.
 -r, --runtime             Runtime Store 8 capture only.
 -n, --no-net              Disable Python/dependency downloads.
@@ -351,6 +402,8 @@ WAren6_<timestamp>.logs.txt
 By default, normal extraction cleans the extracted `WAren6_<timestamp>` case folder after the archive is verified. Tell users to pass `--keep-case-folder` only if they also want the extracted working folder left beside the archive. Inside the archive are `unified_whatsapp.db`, `validation_report.json`, `WAren6.manifest.json`, `logs.txt`, and copied evidence/runtime folders such as `runtime\`, `EBWebView_Default\`, and `sessions\` when present. The larger `reports\` folder is written only when `--reports` is passed or when reports are generated explicitly from an existing DB.
 
 Default operator output does not write Store 8 crypto diagnostic JSON files. Those are research/debug outputs and should appear only when Store 8 debugging, opaque salt work, or crypto profiling is explicitly requested.
+
+Archive selection is self-validating: WAren6 uses `.tar.zst` only after a temporary real archive/readback probe succeeds. On Windows BSD tar installations without `zstd.exe`, it falls back to a verified `.zip` archive. Telegram transfer is still CLI-only (`-tg "BOT_TOKEN" -cid "CHAT_ID"`) and works with either format; `--no-archive` cannot be combined with Telegram transfer, encryption, or auto-delete.
 
 `media_index_report.json` is written only when media indexing is enabled or an explicit media index report path is supplied.
 
@@ -481,13 +534,13 @@ Build field kit online:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\airgap\prepare-wheels.ps1
-powershell -ExecutionPolicy Bypass -File .\airgap\build-airgap-package.ps1 -Name WAren6-FieldKit-v1.1.0
+powershell -ExecutionPolicy Bypass -File .\airgap\build-airgap-package.ps1 -Name WAren6-FieldKit-v2.0.0
 ```
 
 Install/run offline:
 
 ```powershell
-Expand-Archive .\WAren6-FieldKit-v1.1.0.zip -DestinationPath C:\Tools
+Expand-Archive .\WAren6-FieldKit-v2.0.0.zip -DestinationPath C:\Tools
 cd C:\Tools\WAren6-FieldKit
 powershell -ExecutionPolicy Bypass -File .\airgap\install-offline-deps.ps1
 powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -f --no-net -d C:\Cases\WAren6
@@ -647,6 +700,7 @@ Typical estimated breakdown on a modest dual-core with a spinning disk, ~30k mes
 - Deferred index creation (18 indexes wrapped in one BEGIN/COMMIT, 256 MiB cache): **1-3s**
 - Snappy decompression during LevelDB read: **1-3s**
 - Salt hunter file scan, if triggered: **2-10s** (exhaustive by default; `--fast-salt-hunt` for opt-in early exit)
+- Unavailable WebView2 DevTools runtime: **up to 20s by default** before offline fallback; use `--deep-runtime` only when a slow runtime merits the legacy 90s budget.
 
 Get real numbers by running `python waren6.py --unify <case> --profile`. That writes `unify_profile.json` alongside the output DB with per-stage `perf_counter` timings.
 
@@ -660,9 +714,9 @@ If unification is taking uncomfortably long on the target, split the work:
 powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -a
 ```
 
-`-a` acquires and decrypts all databases on the target and packages everything into a `.tar.zst` case archive, skipping the unify step. Also skip `-m` (media indexing) and any `--reports-dir` there — both cost minutes of thermal-throttled CPU that a faster workstation handles in seconds.
+`-a` acquires and decrypts all databases on the target and packages everything into a `.zip` case archive, skipping the unify step. Also skip `-m` (media indexing) and any `--reports-dir` there — both cost minutes of thermal-throttled CPU that a faster workstation handles in seconds.
 
-**Transfer** the `.tar.zst` (plus its `.sha256.txt`, `.manifest.json`, `.logs.txt`) to a workstation, verify SHA-256, extract.
+**Transfer** the `.zip` (plus its `.sha256.txt`, `.manifest.json`, `.logs.txt`) to a workstation, verify SHA-256, extract.
 
 **On the workstation:**
 
@@ -699,12 +753,15 @@ Expected effect on a 30k-message case: target time drops from ~25-40 min (therma
 - Don't flip `--fast-salt-hunt` on as the default. Multi-salt cases exist and early exit loses yield.
 - Don't run `--unify` on the target if you can defer to a workstation. Even without `-m` and reports, you still pay minutes of thermal-throttled CPU on the parse/merge/index-build path.
 
-## Cross-OS Unify
+## Zero-Dependency Architecture & Cross-OS Unify
 
-- Requirements: Python 3.11+, `cryptography` module, `ccl_chromium_reader`.
-- Verified: `--unify` code path contains no Windows-only imports (no `winreg`, no `win32*`, no `ctypes.WinDLL`). Path handling uses `pathlib.Path` throughout.
-- `.tar.zst` extraction on Linux/macOS: `zstd -d case.tar.zst -o case.tar && tar xf case.tar` (or install zstd from your package manager). On Windows without `tar --zstd`, the fallback is `.zip`.
-- Always verify SHA-256 before extract: compare `sha256sum case.tar.zst` to the packaged `.sha256.txt`.
+- Requirements: Python 3.10+ standard library only. **Zero pip packages required.**
+- `ccl_chromium_reader` and `ccl_simplesnappy` are pre-bundled in `vendor/` and loaded dynamically via `sys.path`.
+- On Windows, Store 8 AES-128-CBC decryption uses the operating system's built-in `bcrypt.dll` via standard library `ctypes`.
+- Verified: `--unify` code path works out-of-the-box on clean Python installations without internet or pip access.
+- Retired flags: `-OnlineBootstrap` and `-NoNet` are deprecated no-ops (WAren6 is 100% offline-first).
+- Native ZIP fallback: `.zip` archives are created using native .NET `[System.IO.Compression.ZipFile]`, avoiding missing `zstd.exe` failures and the 2 GB `Compress-Archive` limit.
+
 
 ## Session Key Recovery (updated 2026-07 for newer WA Desktop builds)
 
@@ -720,7 +777,8 @@ Same tier-cascade applies to `nativeSettings.dec.db-wal` -> `nativeSettings.dec.
 ## Where to Look Next
 
 - `docs/kb/perf/Bottlenecks.md` — ranked wall-clock offenders with root cause and fix status.
-- `docs/kb/adr/ADR-003-split-machine-workflow.md` — the acquire-on-target / unify-on-workstation ADR.
-- `docs/kb/adr/ADR-004-session-key-schema-agnostic.md` — session key recovery redesign.
+- `docs/kb/adr/ADR-008-compiled-page-crypto-and-pipeline-optimizations.md` — in-memory C# page decryption (20.7x speedup).
+- `docs/kb/adr/ADR-009-zero-dependency-vendoring-and-native-cng.md` — zero-pip architecture and operator usability.
+- `docs/kb/Deprecation-log.md` — retired features, flags, and replacements.
 - `AI_KB_RULES.md` — rules for AI agents modifying this repo (read before writing code).
-- `docs/kb/NOTES.md` — running log of decisions and gotchas.
+- `docs/kb/NOTES.md` — running log of decisions, benchmarks, and gotchas.

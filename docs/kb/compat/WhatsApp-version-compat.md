@@ -1,7 +1,7 @@
 ---
 title: WhatsApp Desktop version compatibility
 tags: [compat, version]
-updated: 2026-07-04
+updated: 2026-07-16
 ---
 
 # WhatsApp Desktop version compatibility
@@ -34,9 +34,9 @@ If Meta re-signs or re-publishes under a new family name, this launch fails sile
 
 **Fix candidate:** detect empty payload earlier, log the actual JS exception if present, and short-circuit rather than retry 20 × 3 s.
 
-### 3. WebView2 registry override is per-machine
+### 3. WebView2 debugging policy is keyed to the host executable name
 
-`waren6.ps1:3140` sets `HKCU:\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments\WhatsApp.Root.exe`. If the WebView2 runtime executable name changes in a future WhatsApp build (e.g. renamed to `WhatsAppDesktop.exe`), the debugger port never gets applied.
+`Invoke-WAren6RuntimeStore8Capture` sets `HKCU:\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments\WhatsApp.Root.exe`. If the WebView2 host executable name changes in a future WhatsApp build (for example, to `WhatsAppDesktop.exe`), the debugger port is not applied and the runtime supplement falls back offline after its bounded readiness wait (20 seconds by default, 90 seconds with `--deep-runtime`).
 
 **Fix candidate:** on newer versions, also probe `Get-Process` for WA's WebView2 child process, discover its exe leaf name, and set the registry value for that name too.
 
@@ -64,7 +64,7 @@ Newer builds might store `contacts.db`, `nativeSettings.db`, `genericStorage.db`
 
 Chromium may deprecate or tighten remote debugging in future WebView2 versions (they have already added flags like `--remote-debugging-pipe`). A signed release might disable it entirely on locked-down enterprise fleets.
 
-**Not much we can do here — flag as a research/reliability risk in [[NOTES]] rather than a code fix.**
+WAren6 classifies an unavailable, timed-out, invalid, or non-WhatsApp DevTools endpoint and continues the hybrid path offline. This contains the delay but does not make remote debugging available on a locked-down fleet. Use `--deep-runtime` only where a real slow-start observation justifies it.
 
 ## Verification checklist for a new WhatsApp Desktop release
 
@@ -76,7 +76,8 @@ Every time WhatsApp Desktop ships a new visible version, run:
 4. Open `unified_whatsapp.db` in Reader — expect message text, media, reactions, quotes to render.
 5. Compare `validation_report.json` counts to `EXTRACTION_EVENTS`. Store 8 opaque rows > 0 with `store8_runtime_decoded_messages` also > 0 is the healthy shape for hybrid mode.
 6. `messages_missing_local_media` should equal the count of files WhatsApp has not downloaded to disk yet — not a bulk regression.
+7. Run a normal hybrid capture and confirm a successful runtime supplement where it is authorized. If the device is unusually slow, retry explicitly with `--deep-runtime`; do not make the slow budget the default.
 
 ## Test coverage today
 
-`tests/test_waren6_runtime_validation.py` and `tests/test_waren6_hybrid_media.py` cover pipeline invariants against synthetic fixtures. Neither exercises a *real* WhatsApp Desktop install. The verification above must be manual, on a real box.
+`tests/test_waren6_runtime_probe_ps1.py`, `tests/test_waren6_runtime_validation.py`, and `tests/test_waren6_hybrid_media.py` cover bounded local readiness and pipeline invariants against synthetic fixtures. Neither exercises a *real* WhatsApp Desktop install. The verification above must be manual, on a real box.

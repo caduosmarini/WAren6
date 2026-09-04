@@ -48,4 +48,11 @@ This vault is the persistent memory for improvements, decisions, and gotchas. Ke
 | What did we already try? | [[Mistakes-not-to-repeat]] |
 | Why split acquire on target from unify on workstation? | [[adr/ADR-003-split-machine-workflow]] |
 | How does client-key recovery survive schema changes? | [[adr/ADR-004-session-key-schema-agnostic]] |
+| Why does the runtime fallback finish quickly? | [[adr/ADR-005-runtime-fast-fallback]] |
+| Why did archive creation fall back to ZIP? | [[adr/ADR-006-archive-capability-fallback]] |
+| Why are message child tables not constrained by `msg_key` foreign keys? | [[adr/ADR-007-logical-message-key-relations]] |
+| How did we achieve 20x faster decryption without an external .exe? | [[adr/ADR-008-compiled-page-crypto-and-pipeline-optimizations]] |
+| How did we eliminate all pip dependencies and enable airgap operation? | [[adr/ADR-009-zero-dependency-vendoring-and-native-cng]] |
 | How do I get real per-stage timings? | Run `python waren6.py --unify <case> --profile`; see `unify_profile.json` |
+
+

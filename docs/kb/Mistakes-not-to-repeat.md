@@ -57,3 +57,24 @@ Short-form. Each entry: symptom, cause, fix, why-it-happens-again.
 **Symptom:** operator pastes a `-v` log into a bug report; it contains the raw ODUID or decrypted key material.
 **Cause:** debug prints of the crypto context.
 **Fix:** `VERBOSE_CONSOLE = False` by default. The Store 8 crypto profile emits only lengths and SHA-256, never key material.
+
+## 9. Do not let an optional runtime endpoint monopolize acquisition time
+
+**Symptom:** a hybrid run spends roughly 90 seconds in runtime capture, then succeeds offline with no useful reason for the delay.
+**Cause:** a fixed readiness deadline combined with long per-request timeouts and swallowed loopback DevTools errors.
+**Fix:** use the bounded `Invoke-WAren6DevToolsProbe` / `Wait-WAren6DevToolsPage` state machine: 20 seconds by default, short deadline-capped probes, classified diagnostics, and `--deep-runtime` only for a conscious 90-second retry.
+**Why it repeats:** treating the live runtime as mandatory. It is a supplement; preserve and prioritize the offline evidence path.
+
+## 10. Do not infer zstd write support from tar version output
+
+**Symptom:** target-side acquisition succeeds until archive creation, then `tar.exe --zstd` fails because it cannot launch `zstd`.
+**Cause:** Windows BSD tar can accept `--zstd --version` while still depending on an external `zstd.exe` for actual compression.
+**Fix:** prove support with a tiny create-and-readback probe; use the verified ZIP fallback otherwise.
+**Why it repeats:** version output looks like a capability declaration, but it is not an end-to-end archive test.
+
+## 11. Do not use a foreign key for a logical, non-unique message key
+
+**Symptom:** SQLite integrity checks fail with `foreign key mismatch` even though the database was built successfully.
+**Cause:** WhatsApp source variants can legitimately share `messages.msg_key`; it is not a candidate key.
+**Fix:** retain `msg_key` as an indexed correlation field in child evidence tables, without a SQLite foreign-key constraint.
+**Why it repeats:** the field name looks like an identifier, but forensic variant preservation intentionally changes its cardinality.

@@ -25,7 +25,7 @@ class PowerShellRuntimeCaptureTests(unittest.TestCase):
         self.assertIn("function Copy-WAren6RuntimeSupplement", source)
         self.assertRegex(
             source,
-            r"Invoke-WAren6RuntimeStore8Capture\s+-OutputDirectory\s+\$runtimeCaptureRoot",
+            r"Invoke-WAren6RuntimeStore8Capture\s+`?\s+-OutputDirectory\s+\$runtimeCaptureRoot",
         )
         self.assertNotRegex(
             source,
@@ -74,6 +74,45 @@ class PowerShellRuntimeCaptureTests(unittest.TestCase):
         self.assertIn("Hide-WAren6WhatsAppWindows", launch_source)
         self.assertIn("Start-Sleep -Milliseconds", launch_source)
         self.assertNotIn("Hide-WAren6WhatsAppWindowsForPeriod -Seconds 8", launch_source)
+
+    def test_runtime_readiness_uses_fast_default_and_deep_opt_in(self):
+        source = self._source()
+
+        self.assertIn("[switch]$DeepRuntime", source)
+        self.assertIn('"deep-runtime" = "DeepRuntime"', source)
+        self.assertIn("function Get-WAren6RuntimeReadinessBudgetSeconds", source)
+        self.assertIn("return 20", source)
+        self.assertIn("return 90", source)
+
+        runtime_start = source.index("function Invoke-WAren6RuntimeStore8Capture")
+        runtime_end = source.index("function Test-WAren6RuntimeJsonl", runtime_start)
+        runtime_source = source[runtime_start:runtime_end]
+        self.assertIn("[int]$ReadinessBudgetSeconds", runtime_source)
+        self.assertIn("[switch]$DeepRuntime", runtime_source)
+        self.assertIn("[ref]$Diagnostics", runtime_source)
+        self.assertNotIn('Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/list"', runtime_source)
+        self.assertIn("-DeepRuntime:$DeepRuntime", source)
+
+    def test_runtime_readiness_probe_is_bounded_and_diagnosable(self):
+        source = self._source()
+
+        self.assertIn("function Invoke-WAren6DevToolsProbe", source)
+        self.assertIn("[System.Net.HttpWebRequest]", source)
+        self.assertIn("$request.Timeout = $TimeoutMilliseconds", source)
+        self.assertIn("$request.ReadWriteTimeout = $TimeoutMilliseconds", source)
+        self.assertIn("$effectiveProbeTimeoutMilliseconds", source)
+        for status in (
+            "endpoint_unreachable",
+            "endpoint_timeout",
+            "endpoint_http_error",
+            "invalid_target_payload",
+            "no_web_whatsapp_target",
+            "whatsapp_exit_timeout",
+        ):
+            self.assertIn(status, source)
+
+        self.assertIn("$runtimeCaptureDiagnostics", source)
+        self.assertIn("readiness = $runtimeCaptureDiagnostics", source)
 
 
 if __name__ == "__main__":

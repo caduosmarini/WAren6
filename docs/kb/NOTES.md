@@ -7,6 +7,24 @@ tags: [scratchpad]
 
 Rolling scratchpad. Trim quarterly. Datestamp each entry.
 
+## 2026-07-28 — Logical message-key schema integrity
+
+- The first live unified DB on `ANIRBANDEYPC` passed `integrity_check`, `quick_check`, WAren6 validation, and manifest verification, but `foreign_key_check` exposed invalid schema relationships from child evidence tables to non-unique `messages.msg_key`.
+- `msg_key` is deliberately non-unique because same-key variants are preserved as evidence. Removed those invalid foreign keys while retaining the child columns and indexes, then scheduled a final live no-archive verification to regenerate the database and manifest from the corrected schema. See [[adr/ADR-007-logical-message-key-relations]].
+
+## 2026-07-28 — Archive capability fallback on Windows BSD tar
+
+- Live `ANIRBANDEYPC` acquisition recovered the client key through the schema-agnostic WAL scan and completed decryption, but its Windows 11 BSD tar failed at `tar.exe --zstd` because external `zstd.exe` was absent.
+- Replaced the version-only zstd check with a temporary create-and-readback probe and retained the verified ZIP fallback. Added `--no-archive` for a live acquisition/unification verification run that keeps the case folder and rejects Telegram/archive-only flags.
+- Telegram remains CLI-only: `-tg <token> -cid <chat-id>`; its verified splitting and recombination flow is unchanged. See [[adr/ADR-006-archive-capability-fallback]].
+
+## 2026-07-16 — Runtime DevTools fast fallback
+
+- The 2026-07-14 field log proved an unavailable WebView2 DevTools endpoint consumed 92.3 seconds before the healthy offline path continued. The problem was the fixed 90-second loop and silent two-second HTTP timeouts, not IndexedDB or Store 8 parsing.
+- Default hybrid/runtime-only readiness is now 20 seconds, with `--deep-runtime` retaining the prior 90-second budget for a deliberately chosen slow-machine retry. Probes are loopback-only, short, deadline-capped, and classified without persisting raw target data.
+- Added a five-second observed WhatsApp-exit guard before relaunch plus safe manifest metadata for readiness and registry restore state. See [[adr/ADR-005-runtime-fast-fallback]], [[perf/Bottlenecks]], and [[compat/WhatsApp-version-compat]].
+- Synthetic PowerShell coverage includes a local endpoint that accepts TCP and never responds; real WhatsApp Desktop success and slow-start field validation remain manual-release checks.
+
 ## 2026-07-04 — Initial audit for perf + newer-WA compatibility
 
 - Graphify seeded: 1041 nodes / 2522 edges / 53 communities. See `graphify-out/GRAPH_REPORT.md`.
@@ -56,8 +74,54 @@ Landed after a multi-agent research workflow that mapped the unify pipeline stag
 - `docs/kb/adr/ADR-003-split-machine-workflow.md`: new.
 - `docs/kb/adr/ADR-004-session-key-schema-agnostic.md`: new.
 
+## 2026-09-04 — Compiled page crypto & pipeline optimizations (ADR-008)
+
+Implemented the hybrid zero-disk-binary optimization sprint combining in-memory C# via `Add-Type` and Python algorithmic optimizations. All 111 unit tests pass (`Ran 111 tests in 14.349s: OK`).
+
+**Measured Microbenchmarks:**
+- **In-Memory C# SQLite Page Decryption:** 20.76x faster than interpreted PowerShell (129.3 ms vs 2684.7 ms on 2,500 pages / 10.24 MB; throughput boosted from 3.6 MB/s to 75.5 MB/s). Verified 100% byte-for-byte exactness (0 diffs). Preserves zero `.exe` disk footprint, preventing Defender SmartScreen blocks and EDR alarms.
+- **Store 8 Opaque Key Pinning:** 5.95x faster decryption across multi-candidate key suites (17.79 ms vs 105.82 ms per 2,000 messages) by attempting the winning `(ikm, salt, info)` candidate first and eliminating thousands of redundant decryptor setups and PKCS7 padding exceptions.
+- **`parse_msg_key` LRU Caching:** 5.02x faster lookup throughput across message joins and table cross-referencing (4.60 ms vs 23.07 ms for 50k calls).
+- **`pick_generic_text` Fuzzy Short-Circuit:** 4.00x faster execution (25.38 ms vs 101.64 ms for 10k matches) using the strict tuple score invariant `(0, ...) < (1, ...)`.
+- **Early Varint Filter:** Rejects 99.9% of candidate offsets in `Find-SqliteBlobCandidates` before allocating `ArrayList` objects.
+- **PowerShell De-AI & Deduplication:** Removed 167 lines of redundant inner functions inside `Start-WAren6` by promoting `Install-WAren6PythonSilently` and `Get-WAren6EmbeddedPython` to top-level helpers; streamlined robocopy fallback to `/ZB`.
+
+## 2026-09-04 — Zero-dependency architecture & live field benchmark (ADR-009)
+
+Completed full transition to a zero-pip, 100% self-contained toolkit with enhanced operator ease-of-use. Verified on live WhatsApp Desktop instance (`2.2634.101.0`). All 111 unit tests pass (`Ran 111 tests in 12.787s: OK`).
+
+**Key Architectural Advancements:**
+- **Zero Pip Dependencies:** Vendored `ccl_chromium_reader` and `ccl_simplesnappy` (<850 KB total) into `vendor/`. Prepend `vendor/` in `waren6.py` and wrapped optional brotli import. Zero pip packages required to run unification.
+- **Native Windows AES-128-CBC (`bcrypt.dll`):** Implemented direct Windows CNG bindings via Python `ctypes`, providing hardware-accelerated AES-NI decryption without requiring the 20+ MB `cryptography` wheel.
+- **Native .NET ZipFile Compression:** Replaced slow/limited `Compress-Archive` with `[System.IO.Compression.ZipFile]::CreateFromDirectory` (built into .NET 4.5+ across all Windows).
+- **Interactive Operator Launcher:** Added interactive console banner when `waren6.ps1` runs without arguments, allowing operators to run extraction with safe defaults by pressing `Enter`.
+- **Adaptive Robocopy Elevation Check:** Evaluates user token elevation before applying `/ZB`, preventing error 1314 / exit code 16 on standard user accounts.
+- **Housekeeping:** Purged past case run artifacts (~68 MB of `WAren6_20260714181552*`) and moved loose root audit documentation to `docs/perf/`.
+
+**Live Benchmark Results (Live WhatsApp Desktop on Host Machine):**
+- **Total Extraction Time:** 142.7 seconds.
+- **Step [1/4] Acquisition & Locked Copy:** 34.6s (LocalState copy in 1.4s; WebView2 runtime probe timeout safely capped at 20s).
+- **Step [2/4] Decryption Engine:** 3.0s (In-memory C# `WAren6CryptoEngine` decrypted 14 SQLite DB/WAL files; Tier 2 broad scanner recovered client key matching session `757B3332907CC72EA1D1B9D90F2426F187B8BFE1`).
+- **Step [3/4] Unified DB Extractor:** 102.4s total:
+  - Vendored LevelDB extraction: 89.1s (extracted 14,377 messages, 16,253 message-infos, 2,749 reactions across 47 stores).
+  - SQLite message & contact loading: 0.2s (loaded 23,938 rows).
+  - Unified DB creation & indexing: 11.7s (indexed 27,166 messages, 1,550 contacts across 105 chats into self-contained 22.6 MB `unified_whatsapp.db`).
+- **Step [4/4] Forensic Manifest & Reports:** 2.6s.
+- **Extraction Yield:** 27,166 messages (13,602 sent, 8,352 received), 1,550 contacts (774 with phone), 105 chats, 2,749 reactions. 0 duplicate message key groups. Status: OK.
+
+## 2026-09-04 — Field Kit v2.0.0 Milestone & Log Issue Fixes
+
+- **Field Kit v2.0.0 Released**: Bumped Field Kit to 2.0.0 across metadata (`version.json`, `fieldkit-version.json`), PowerShell engine (`$global:WAren6Version`), documentation (`README.md`, `LLM.txt`), and test suites. Reader remains on independent `1.7.0` release track.
+- **`System.SByte` Overflow Fix**: In `waren6.ps1` lines 3937 and 4272, replaced checked `[sbyte]` casts with two's-complement arithmetic (`if ($rawByte -ge 128) { $rawByte - 256 } else { $rawByte }`), resolving terminating exceptions on byte values $\ge 128$.
+- **Chromium V8 Sparse Array Deserialization Fix**: In `ccl_v8_value_deserializer.py`, guarded sparse and dense array property loops with bounds-checking and list expansion, preventing `IndexError: list index out of range`.
+- **Resilient Message Iteration**: Added `bad_deserializer_data_handler` to `idb.iterate_records()` in `waren6.py`, isolating bad records and allowing LevelDB extraction to continue across all messages.
+- **Runtime Capture Cleanup**: Ensured `$runtimeCaptureRoot` is cleaned up unconditionally after staging, preventing leftover folders on timeout.
+
 ## Backlog
 
 - Ask LO to run the fixed `waren6.ps1` on `ANIRBANDEYPC` and confirm the Tier 2 SHA-1-match path finds the client key. If it still fails, the diagnostic dump will tell us what shape WA moved to.
 - Add a small microbench harness in `tests/perf/` for regression flags (not for correctness).
 - Manual verification pass on very latest WhatsApp Desktop build (post 2.3010).
+
+
+

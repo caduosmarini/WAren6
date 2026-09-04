@@ -24,8 +24,9 @@ waren6.ps1 (Windows shell)
   │     └── contacts.db
   ├── Runtime supplement (best-effort, hidden by default)
   │     ├── Set WebView2 registry: --remote-debugging-port=9222
+  │     ├── Stop existing WhatsApp and wait <=5s for observed exit
   │     ├── Launch WhatsApp: explorer.exe shell:AppsFolder\<package-family>!App   ⚠ HARD-CODED
-  │     ├── Poll http://127.0.0.1:9222/json/list  (90s budget)
+  │     ├── Poll loopback /json/list (20s default; 90s with --deep-runtime; each probe <=500ms)
   │     ├── CDP Runtime.evaluate → JS expression from Get-WAren6RuntimeExpression
   │     │     └── serialises Store 8 rows to JSONL
   │     └── Writes runtime\runtime_store8_messages.jsonl
@@ -41,7 +42,7 @@ waren6.ps1 (Windows shell)
   │     ├── Quote body enrichment (SQL WITH … original_quotes)
   │     ├── Validation (source-vs-unified coverage counters)
   │     └── unified_whatsapp.db + validation_report.json + WAren6.manifest.json
-  ├── Archive (tar.zst preferred, zip fallback)
+  ├── Archive (tar.zst after a real local probe, otherwise verified zip fallback)
   ├── SHA-256 of archive
   └── Optional Telegram transfer (split, encrypt, upload, verify)
 ```
@@ -51,12 +52,15 @@ waren6.ps1 (Windows shell)
 | Mode | Trigger | Uses live WA | Emits unified DB | Archive |
 |---|---|---|---|---|
 | Hybrid (default) | no flag | yes (best-effort) | yes | yes |
+| Hybrid retained | `--no-archive` | yes (best-effort) | yes | no; case folder remains |
 | Offline | `-f` / `--offline` | no | yes | yes |
 | Acquire-only | `-a` | no | no (fallback: `WAren6_unify_later.txt`) | yes |
 | Unify-only | `-u -c <case-or-archive>` | no | yes | no |
 | Runtime-only | `-r -c <folder>` | yes | no | no (JSONL only) |
 | Preflight | `-doc` | no | no | no |
 | Dry-run | `--dry` | no | no | no |
+
+Hybrid and runtime-only modes use a bounded 20-second WebView2 readiness wait by default. `--deep-runtime` retains the 90-second recovery budget for an unusually slow runtime; it does not alter offline evidence acquisition or unification.
 
 ## Key modules in `waren6.py`
 
@@ -80,3 +84,5 @@ waren6.ps1 (Windows shell)
 Currently all work in `waren6.py` runs in one Python process, one thread. IndexedDB read → SQLite insert → media hash all block one another. On modest field-kit hardware this is the single largest lever.
 
 See [[perf/Bottlenecks]] for the ranked opportunities.
+
+`messages.msg_key` is a logical evidence-correlation key rather than a database key: variant history can intentionally retain more than one row with the same value. Tables such as media, receipts, reactions, mentions, and edit history preserve that key without a SQLite foreign-key constraint; their indexes support the relationship without rejecting valid variants.

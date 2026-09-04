@@ -11,6 +11,26 @@ import waren6
 
 
 class UnifiedSchemaPerformanceTests(unittest.TestCase):
+    def test_schema_foreign_key_check_allows_intentional_duplicate_message_keys(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(waren6.UNIFIED_SCHEMA)
+            conn.execute("INSERT INTO chats(chat_jid) VALUES (?)", ("0@c.us",))
+            conn.executemany(
+                """
+                INSERT INTO messages(
+                    msg_key, msg_id, chat_jid, timestamp, source, source_id, body_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    ("shared-logical-key", "first", "0@c.us", 1, "indexeddb", "first", "text_present"),
+                    ("shared-logical-key", "second", "0@c.us", 2, "genericStorage", "second", "text_present"),
+                ],
+            )
+            self.assertEqual(list(conn.execute("PRAGMA foreign_key_check")), [])
+        finally:
+            conn.close()
+
     def test_schema_indexes_quote_lookup_by_chat_and_message_id(self):
         conn = sqlite3.connect(":memory:")
         try:

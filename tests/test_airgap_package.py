@@ -87,7 +87,7 @@ class AirgapPackageTests(unittest.TestCase):
                 (root / name).write_text(name, encoding="utf-8")
             (root / "airgap" / "README.md").write_text("airgap", encoding="utf-8")
 
-            package = build_airgap_package.build_package(root, output, package_name="WAren6-FieldKit-v1.1.0")
+            package = build_airgap_package.build_package(root, output, package_name="WAren6-FieldKit-v2.0.0")
 
             self.assertTrue(package.archive_path.exists())
             self.assertTrue(package.sha256_path.exists())

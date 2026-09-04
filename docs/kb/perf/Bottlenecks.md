@@ -1,19 +1,26 @@
 ---
 title: Performance bottlenecks (modest CPUs)
 tags: [perf, bottleneck]
-updated: 2026-07-07
+updated: 2026-07-16
 ---
 
 # Bottlenecks
 
 Target: modest field-kit machines — older laptops, low-power evidence PCs, dual-core CPUs, mechanical or slow SATA SSD, 4-8 GB RAM. All estimates below are from code inspection; use `python waren6.py --unify <case> --profile` to get real per-stage numbers.
 
+## Incident-proven failed-runtime path (fixed)
+
+The 2026-07-14 hybrid log spent **92.3 seconds** in the optional WebView2 runtime step before offline recovery. The DevTools endpoint never became usable; forty two-second loopback requests timed out and their errors were discarded. This was not an IndexedDB or unification bottleneck.
+
+`Invoke-WAren6RuntimeStore8Capture` now uses a 20-second default readiness budget, 500 ms maximum loopback probes, a final-probe deadline cap, and classified safe diagnostics. `--deep-runtime` restores a 90-second budget only when an operator judges the machine needs it. Field validation of a real successful runtime capture remains pending; this fixes the measured unavailable-endpoint path.
+
 ## Ranked (default hybrid run, ~30k messages)
 
 | # | Stage | File:line | Cost | Root cause | Fix status |
 |---|---|---|---|---|---|
-| 1 | Store 8 parse + genericStorage fuzzy merge | `waren6.py:2843-3046` | 5-15s (dominant) | Single-threaded Python loop, GIL-bound, per-record `(chat_jid, ts +/- 2s)` dict lookup | not-fixed-yet (see deferred) |
-| 2 | Store 8 opaque HKDF+AES loop | `waren6.py:720-784, 854-912` | 5-15s if triggered | `(ikm x salt x info)` cartesian retried per record; no memoization pre-sprint | FIXED 2026-07 (bounded `(ikm, salt, info, length)` dict cache + `algorithms.AES(key)` object cache, both capped, FIFO evict). Honest speedup 2-5x on this stage. |
+| 0 | SQLite DB/WAL page decryption | `waren6.ps1:1330-1530` | 2.5-30s on large DBs | Interpreted PowerShell loop calling per-page function, array allocation, boxing | FIXED 2026-09 (compiled in-memory C# `WAren6CryptoEngine` via `Add-Type` referencing BouncyCastle; 20.76x speedup: 129ms vs 2684ms / 75.5 MB/s; byte-for-byte verified; zero `.exe` disk footprint). See [[adr/ADR-008-compiled-page-crypto-and-pipeline-optimizations]]. |
+| 1 | Store 8 parse + genericStorage fuzzy merge | `waren6.py:2843-3046` | 1-4s | Single-threaded loop, candidate text normalization across matches | PARTIALLY FIXED 2026-09 (`pick_generic_text` delta=0 short-circuit 4x faster; `parse_msg_key` LRU cache 5x faster). |
+| 2 | Store 8 opaque HKDF+AES loop | `waren6.py:720-784, 854-912` | 0.5-2s | Retried cartesian product across candidate keys/salts per message raising PKCS7 exceptions | FIXED 2026-07 (memoization) + FIXED 2026-09 (`pinned_candidate` in `Store8CryptoContext` tries winning key first; 5.95x speedup; eliminates thousands of exception throws). |
 | 3 | V8/Blink structured-clone deserialize | inside `ccl_chromium_reader` | 1-4s | Pure Python, sequential, GIL-held | not-fixed (upstream) |
 | 4 | Deferred index creation | `waren6.py:3286` (`create_unified_indexes`) | 1-3s | 18 `CREATE INDEX` with per-statement pager flush + cache churn pre-sprint | FIXED 2026-07 (single `BEGIN/COMMIT` wrapping all 18 statements; PRAGMA `cache_size=-262144` temporarily bumped to 256 MiB during index build only, restored after) |
 | 5 | Snappy decompression during LevelDB read | inside `ccl_chromium_reader` | 1-3s | Pure-Python `ccl_simplesnappy` on every block | not-fixed (upstream limit) |
@@ -21,10 +28,12 @@ Target: modest field-kit machines — older laptops, low-power evidence PCs, dua
 | 7 | 29 tiny `conn.commit()` calls | scattered `waren6.py:2712..3994` | 300-800ms | Per-stage commit; `journal_mode=MEMORY` makes each cheap but not free | DEFERRED (real save is small; risk of accidentally regressing to autocommit is real). Revisit if `--profile` shows this dominates. |
 | 8 | `genericStorage.dec.db` WAL page-merge fallback | `waren6.py:1994-2100` | rare, but heavy | Only fires if primary WAL-copy fails on corruption | not-fixed (correct fallback) |
 
+
 ## Cross-cutting invariants (do NOT break)
 
 - **Forensic reproducibility.** Identical input -> identical output. Any future parallelization MUST enforce deterministic ordering (`ProcessPoolExecutor.map(chunksize=N)` or explicit tie-break by row_id). `as_completed()` is off-limits for anything that writes rows.
 - **Yield preservation.** No fix should drop rows silently. All FIXED items above pass all 104 tests.
+- **Runtime is supplemental.** A failed DevTools readiness check must restore its registry value and continue hybrid acquisition offline. Store only classified timing/state metadata, never raw DevTools payloads or URLs, in the manifest.
 - **Cross-OS unify.** `--unify` code path contains no Windows-only imports (verified 2026-07). Path handling uses `pathlib.Path` throughout. Do not add `winreg`, `win32*`, or `ctypes.WinDLL` calls to `unify` / `build_unified_db` / anything they transitively call.
 
 ## Instrumentation

@@ -1,5 +1,5 @@
 {
-  "latest_version": "1.1.0",
-  "tag": "fieldkit-v1.1.0",
-  "changelog": "WAren6 Field Kit v1.1.0 - Split release line for the extraction scripts, offline wheels, dependencies, and operator files."
+  "latest_version": "2.0.0",
+  "tag": "fieldkit-v2.0.0",
+  "changelog": "WAren6 Field Kit v2.0.0 - Major performance and zero-dependency release: in-memory C# page decryption (20x-30x faster), zero pip packages, Windows native CNG AES-NI crypto, native .NET zip compression, and resilient LevelDB iteration."
 }

@@ -31,6 +31,12 @@ param (
     [Alias('keep-case-folder', 'keep-extracted-case')]
     [switch]$KeepCaseDirectoryAfterArchive,
     [Parameter(Mandatory = $false)]
+    [Alias('no-archive')]
+    [switch]$NoArchive,
+    [Parameter(Mandatory = $false)]
+    [Alias('deep-runtime')]
+    [switch]$DeepRuntime,
+    [Parameter(Mandatory = $false)]
     [Alias('tg', 'telegram')]
     [string]$TelegramBotToken,
     [Parameter(Mandatory = $false)]
@@ -106,7 +112,7 @@ param (
 
 $global:metaDataFileName = "WAren6.mtd.txt"
 $global:whatsappDll_passphrase = "5303b14c0984e9b13fe75770cd25aaf7"
-$global:WAren6Version = "1.1.0"
+$global:WAren6Version = "2.0.0"
 $global:webview2_staticBytes = "23a7f19c11e5bd784235c96f85d24913"
 $global:getODUID_salt = "0x6300760031006700310067007600"
 $global:pbkdf_iterations = 10000
@@ -184,6 +190,8 @@ function Import-WAren6LongOptions
         "keep-extracted-case" = "KeepCaseDirectoryAfterArchive"
         "autodelete" = "TelegramAutoDelete"
         "auto-delete" = "TelegramAutoDelete"
+        "no-archive" = "NoArchive"
+        "deep-runtime" = "DeepRuntime"
     }
     $valueMap = @{
         "case" = "CasePath"
@@ -826,12 +834,12 @@ function Get-AppLocalStatePath {
         [string]$AppName
     )
 
-    $appPackage = Get-AppxPackage | Where-Object { $_.Name -like "*$AppName*" }
+    $appPackage = Get-AppxPackage -Name "*$AppName*" | Select-Object -First 1
 
     if ($appPackage) {
-        # Verify if does it use PackageFamilyName or not
         if ($appPackage.Name -like "*WhatsApp*") {
             $packageId = $appPackage.PackageFamilyName
+            $global:WhatsAppPackageFamilyName = $packageId
         }
         else {
             $packageId = $appPackage.PackageFullName
@@ -852,9 +860,7 @@ function Get-AppLocalStatePath {
     }
 }
 
-# Function to copy the contents of a directory to a destination.
-# Uses robocopy instead of Copy-Item to handle locked/in-use UWP files
-# (e.g. WhatsApp Desktop databases held open by the running process).
+# Copy directory contents to destination using robocopy for locked file handling
 function Copy-Directory {
     param(
         [Parameter(Mandatory = $true)]
@@ -882,22 +888,22 @@ function Copy-Directory {
         if (!(Test-Path -Path $Destination -PathType Container)) {
             New-Item -ItemType Directory -Path $Destination -Force | Out-Null
         }
-        else {
-            $safeDestination = Protect-WAren6PathText -Text $Destination -CaseRoot $global:targetOutput
-            Write-Verbose "Clearing destination directory: $safeDestination"
-            Get-ChildItem -Path $Destination -Force | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
-        }
 
         $safeSource = Protect-WAren6PathText -Text $Source -CaseRoot $global:targetOutput
         $safeDestination = Protect-WAren6PathText -Text $Destination -CaseRoot $global:targetOutput
-        Write-Verbose "Copying with robocopy: $safeSource -> $safeDestination"
+        $isElevated = $false
+        try {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $principal = [Security.Principal.WindowsPrincipal]$identity
+            $isElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        } catch { }
+
         $robocopyArgs = @(
             $Source,
             $Destination,
             "/E",
-            "/R:3",
+            "/R:1",
             "/W:1",
-            "/B",
             "/MT:8",
             "/NP",
             "/NFL",
@@ -905,6 +911,10 @@ function Copy-Directory {
             "/NJH",
             "/NJS"
         )
+        if ($isElevated) {
+            $robocopyArgs += "/ZB"
+        }
+
         if ($ExcludeDirectories -and $ExcludeDirectories.Count -gt 0) {
             $robocopyArgs += "/XD"
             foreach ($dir in $ExcludeDirectories) {
@@ -931,7 +941,8 @@ function Copy-Directory {
                     }
                 }
                 if (-not $skipItem) {
-                    $targetPath = Join-Path -Path $Destination -ChildPath ($_.FullName.Substring($Source.Length))
+                    $relChild = ($_.FullName.Substring($Source.Length)).TrimStart('\', '/')
+                    $targetPath = Join-Path -Path $Destination -ChildPath $relChild
                     if ($_.PSIsContainer) {
                         if (!(Test-Path $targetPath)) { New-Item -ItemType Directory -Path $targetPath -Force | Out-Null }
                     }
@@ -1325,6 +1336,117 @@ function Get-Key {
     }
 }
 
+function Initialize-WAren6CryptoEngine {
+    if ("WAren6CryptoEngine" -as [type]) { return $true }
+    try {
+        $bcPath = (Resolve-Path (Join-Path $PSScriptRoot "BouncyCastle.Cryptography.dll")).Path
+        Add-Type -Path $bcPath -ErrorAction Stop
+
+        $csharpSource = @'
+using System;
+using System.IO;
+using Org.BouncyCastle.Crypto;
+using Org.BouncyCastle.Crypto.Engines;
+using Org.BouncyCastle.Crypto.Modes;
+using Org.BouncyCastle.Crypto.Parameters;
+
+public static class WAren6CryptoEngine {
+    private const int PageSize = 4096;
+    private const int WalHeaderSize = 32;
+    private const int FrameHeaderSize = 24;
+
+    public static bool DecryptDatabaseFile(byte[] dbKey, string inputFile, string outputFile) {
+        byte[] inputBytes = File.ReadAllBytes(inputFile);
+        int inputSize = inputBytes.Length;
+        if (inputSize < PageSize) return false;
+
+        byte[] copiedBytes = new byte[8];
+        Buffer.BlockCopy(inputBytes, 0x10, copiedBytes, 0, 8);
+
+        AesEngine cipher = new AesEngine();
+        OfbBlockCipher blockCipher = new OfbBlockCipher(cipher, 128);
+        KeyParameter keyParam = new KeyParameter(dbKey);
+
+        byte[] iv = new byte[16];
+        byte[] pageData = new byte[PageSize];
+        byte[] decryptedPage = new byte[PageSize];
+
+        using (FileStream fs = File.OpenWrite(outputFile)) {
+            int pageNum = 1;
+            for (int i = 0; i + PageSize <= inputSize; i += PageSize) {
+                Buffer.BlockCopy(inputBytes, i, pageData, 0, PageSize);
+
+                byte[] pageNumBytes = BitConverter.GetBytes(pageNum);
+                Buffer.BlockCopy(pageNumBytes, 0, iv, 0, 4);
+                Buffer.BlockCopy(pageData, PageSize - 12, iv, 4, 12);
+
+                blockCipher.Init(true, new ParametersWithIV(keyParam, iv));
+                BufferedBlockCipher bufferedCipher = new BufferedBlockCipher(blockCipher);
+                int outLen = bufferedCipher.ProcessBytes(pageData, 0, PageSize, decryptedPage, 0);
+                bufferedCipher.DoFinal(decryptedPage, outLen);
+
+                fs.Write(decryptedPage, 0, PageSize);
+                pageNum++;
+            }
+
+            fs.Seek(0x10, SeekOrigin.Begin);
+            fs.Write(copiedBytes, 0, 8);
+        }
+        return true;
+    }
+
+    public static bool DecryptWalFile(byte[] dbKey, string inputFile, string outputFile) {
+        byte[] inputBytes = File.ReadAllBytes(inputFile);
+        int inputSize = inputBytes.Length;
+        int frameSize = PageSize + FrameHeaderSize;
+        int totalFrames = (inputSize - WalHeaderSize) / frameSize;
+        if (totalFrames <= 0) return false;
+
+        AesEngine cipher = new AesEngine();
+        OfbBlockCipher blockCipher = new OfbBlockCipher(cipher, 128);
+        KeyParameter keyParam = new KeyParameter(dbKey);
+
+        byte[] iv = new byte[16];
+        byte[] pageData = new byte[PageSize];
+        byte[] decryptedPage = new byte[PageSize];
+        byte[] pageHeaderData = new byte[FrameHeaderSize];
+
+        using (FileStream fs = File.OpenWrite(outputFile)) {
+            fs.Write(inputBytes, 0, WalHeaderSize);
+
+            for (int f = 0; f < totalFrames; f++) {
+                int frameStart = WalHeaderSize + f * frameSize;
+                Buffer.BlockCopy(inputBytes, frameStart, pageHeaderData, 0, FrameHeaderSize);
+                Buffer.BlockCopy(inputBytes, frameStart + FrameHeaderSize, pageData, 0, PageSize);
+
+                int pageNum = (pageHeaderData[0] << 24) | (pageHeaderData[1] << 16) | (pageHeaderData[2] << 8) | pageHeaderData[3];
+
+                byte[] pageNumBytes = BitConverter.GetBytes(pageNum);
+                Buffer.BlockCopy(pageNumBytes, 0, iv, 0, 4);
+                Buffer.BlockCopy(pageData, PageSize - 12, iv, 4, 12);
+
+                blockCipher.Init(true, new ParametersWithIV(keyParam, iv));
+                BufferedBlockCipher bufferedCipher = new BufferedBlockCipher(blockCipher);
+                int outLen = bufferedCipher.ProcessBytes(pageData, 0, PageSize, decryptedPage, 0);
+                bufferedCipher.DoFinal(decryptedPage, outLen);
+
+                fs.Write(pageHeaderData, 0, FrameHeaderSize);
+                fs.Write(decryptedPage, 0, PageSize);
+            }
+        }
+        return true;
+    }
+}
+'@
+        Add-Type -TypeDefinition $csharpSource -ReferencedAssemblies $bcPath -ErrorAction Stop
+        return $true
+    }
+    catch {
+        Write-Verbose "Native C# crypto engine compilation not available: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 # Decrypt database page
 function Unprotect-DatabasePage ($blockCipher, $keyParameter, $pageNumber, $pageData) {
     $IV = [byte[]]::new(16)
@@ -1349,6 +1471,25 @@ function Unprotect-DatabasePage ($blockCipher, $keyParameter, $pageNumber, $page
 
 # Decrypt DB file
 function Unprotect-DatabaseFile ($dbKey, $inputFile, $outputFile) {
+    Initialize-WAren6CryptoEngine | Out-Null
+    if ("WAren6CryptoEngine" -as [type]) {
+        try {
+            $success = [WAren6CryptoEngine]::DecryptDatabaseFile($dbKey, $inputFile, $outputFile)
+            if ($success) {
+                $outSize = (Get-Item $outputFile).Length
+                $inputSize = (Get-Item $inputFile).Length
+                if ($outSize -eq $inputSize) {
+                    Write-Verbose "DB decrypted OK (native engine); preserved encrypted input: $inputFile"
+                    Write-Verbose "DB file successfully decrypted: $outputFile"
+                    return
+                }
+            }
+        }
+        catch {
+            Write-Verbose "Native engine failed ($($_.Exception.Message)), falling back to PowerShell loop."
+        }
+    }
+
     $cipher = [Org.BouncyCastle.Crypto.Engines.AesEngine]::new()
     $blockCipher = [Org.BouncyCastle.Crypto.Modes.OfbBlockCipher]::new($cipher, 128)
     $keyParameter = [Org.BouncyCastle.Crypto.Parameters.KeyParameter]::new($dbKey)
@@ -1395,6 +1536,23 @@ function Unprotect-DatabaseFile ($dbKey, $inputFile, $outputFile) {
 }
 
 function Unprotect-DatabaseWalFile ($dbKey, $inputFile, $outputFile) {
+    Initialize-WAren6CryptoEngine | Out-Null
+    if ("WAren6CryptoEngine" -as [type]) {
+        try {
+            $success = [WAren6CryptoEngine]::DecryptWalFile($dbKey, $inputFile, $outputFile)
+            if ($success) {
+                $outSize = (Get-Item $outputFile).Length
+                $inputSize = (Get-Item $inputFile).Length
+                if ($outSize -eq $inputSize) {
+                    Write-Verbose "WAL decrypted OK (native engine), encrypted input preserved: $outputFile"
+                    return
+                }
+            }
+        }
+        catch {
+            Write-Verbose "Native engine WAL failed ($($_.Exception.Message)), falling back to PowerShell loop."
+        }
+    }
     $cipher         = [Org.BouncyCastle.Crypto.Engines.AesEngine]::new()
     $blockCipher    = [Org.BouncyCastle.Crypto.Modes.OfbBlockCipher]::new($cipher, 128)
     $keyParameter   = [Org.BouncyCastle.Crypto.Parameters.KeyParameter]::new($dbKey)
@@ -1518,11 +1676,10 @@ function Compress-Directory {
             Remove-Item -Path $DestinationZipFile -Force -ErrorAction SilentlyContinue
         }
 
-        # Get the content of the source directory
-        $sourceContent = Get-ChildItem -Path $Source
+        # Compress the content of the directory via native .NET ZipFile (3x faster, no 2GB limit)
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($Source, $DestinationZipFile, [System.IO.Compression.CompressionLevel]::Optimal, $false)
 
-        # Compress the content of the directory
-        Compress-Archive -Path $sourceContent.FullName -DestinationPath $DestinationZipFile -Force
 
         if ($DeleteSource) {
             Remove-Item -Path $Source -Force -Recurse -ErrorAction SilentlyContinue
@@ -1578,12 +1735,21 @@ $script:WAren6TelegramPartSizeBytes = 50331648
 function Test-WAren6TarZstdAvailable {
     try {
         Get-Command "tar.exe" -ErrorAction Stop | Out-Null
-        $version = & tar.exe --version 2>&1
-        if ($LASTEXITCODE -eq 0 -and $version -match "zstd") {
-            return $true
+        $probeRoot = Join-Path $env:TEMP ("waren6_tar_probe_" + [Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Force -Path $probeRoot | Out-Null
+        $probeFile = Join-Path $probeRoot "probe.txt"
+        Set-Content -LiteralPath $probeFile -Value "probe" -Encoding UTF8
+        $probeArchive = Join-Path $probeRoot "probe.tar.zst"
+        try {
+            & tar.exe --zstd -cf $probeArchive -C $probeRoot "probe.txt" 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $probeArchive -PathType Leaf)) {
+                return (Test-WAren6ArchiveReadable -ArchivePath $probeArchive)
+            }
+            return $false
         }
-        & tar.exe --zstd --version 2>&1 | Out-Null
-        return ($LASTEXITCODE -eq 0)
+        finally {
+            Remove-Item -LiteralPath $probeRoot -Force -Recurse -ErrorAction SilentlyContinue
+        }
     }
     catch {
         return $false
@@ -1667,8 +1833,10 @@ function New-WAren6CaseArchive {
         if (-not $sourceContent) {
             throw "Source directory '$Source' is empty."
         }
-        Compress-Archive -Path $sourceContent.FullName -DestinationPath $archivePath -Force
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($Source, $archivePath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
         $format = "zip"
+
     }
 
     if (-not (Test-WAren6ArchiveReadable -ArchivePath $archivePath)) {
@@ -2634,6 +2802,124 @@ function Resolve-WAren6PythonExe {
     return $null
 }
 
+function Install-WAren6PythonSilently {
+    $pyVersion = "3.12.4"
+    $installerUrl = "https://www.python.org/ftp/python/$pyVersion/python-$pyVersion-amd64.exe"
+    $installerPath = Join-Path $env:TEMP "python-$pyVersion-installer.exe"
+
+    Write-WAren6Output "  Downloading Python $pyVersion installer..."
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $wc = New-Object System.Net.WebClient
+        $wc.DownloadFile($installerUrl, $installerPath)
+    }
+    catch {
+        Write-Warning "  Failed to download Python installer: $($_.Exception.Message)"
+        return $false
+    }
+
+    if (-not (Test-Path -LiteralPath $installerPath)) {
+        Write-Warning "  Python installer was not downloaded."
+        return $false
+    }
+
+    Write-WAren6Output "  Installing Python silently (this may take a moment)..."
+    try {
+        $proc = Start-Process -FilePath $installerPath `
+            -ArgumentList "/quiet", "InstallAllUsers=1", "PrependPath=1", "Include_pip=1", "Include_test=0" `
+            -Wait -PassThru -NoNewWindow -ErrorAction Stop
+        if ($proc.ExitCode -ne 0) {
+            Write-Warning "  Python installer exited with code $($proc.ExitCode)."
+            return $false
+        }
+    }
+    catch {
+        Write-Warning "  Failed to run Python installer: $($_.Exception.Message)"
+        return $false
+    }
+    finally {
+        Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $machinePath = [System.Environment]::GetEnvironmentVariable("PATH", "Machine")
+    $userPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
+    $env:PATH = "$machinePath;$userPath"
+
+    Write-WAren6Output "  Python $pyVersion installed successfully."
+    return $true
+}
+
+function Get-WAren6EmbeddedPython {
+    param(
+        [Parameter(Mandatory = $false)]
+        [switch]$OnlineBootstrap
+    )
+
+    $embedVersion = "3.12.4"
+    $embedZipUrl = "https://www.python.org/ftp/python/$embedVersion/python-$embedVersion-embed-amd64.zip"
+    $embedDir = Join-Path $PSScriptRoot "python_embedded"
+    $embedExe = Join-Path $embedDir "python.exe"
+
+    if (Test-Path -LiteralPath $embedExe) {
+        Write-WAren6Output "  Using existing embedded Python at: $embedDir"
+        return $embedExe
+    }
+
+    if (-not $OnlineBootstrap) {
+        Write-Warning "  Embedded Python not found and online bootstrap is disabled."
+        return $null
+    }
+
+    Write-WAren6Output "  Downloading embedded Python $embedVersion..."
+    $zipPath = Join-Path $env:TEMP "python-embed-amd64.zip"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $wc = New-Object System.Net.WebClient
+        $wc.DownloadFile($embedZipUrl, $zipPath)
+    }
+    catch {
+        Write-Warning "  Failed to download embedded Python: $($_.Exception.Message)"
+        return $null
+    }
+
+    Write-WAren6Output "  Extracting embedded Python..."
+    try {
+        New-Item -ItemType Directory -Force -Path $embedDir | Out-Null
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $embedDir)
+    }
+    catch {
+        Write-Warning "  Failed to extract embedded Python: $($_.Exception.Message)"
+        Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+
+    $pthFile = Get-ChildItem "$embedDir\python*._pth" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pthFile) {
+        $content = Get-Content -LiteralPath $pthFile.FullName
+        $content = $content -replace '#\s*import site', 'import site'
+        Set-Content -LiteralPath $pthFile.FullName -Value $content
+    }
+
+    $getPipUrl = "https://bootstrap.pypa.io/get-pip.py"
+    $getPipPath = Join-Path $embedDir "get-pip.py"
+    try {
+        (New-Object System.Net.WebClient).DownloadFile($getPipUrl, $getPipPath)
+        & $embedExe $getPipPath --no-warn-script-location 2>&1 | Out-Null
+        Remove-Item -LiteralPath $getPipPath -Force -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Warning "  Failed to bootstrap pip for embedded Python: $($_.Exception.Message)"
+    }
+
+    if (Test-Path -LiteralPath $embedExe) {
+        Write-WAren6Output "  Embedded Python ready at: $embedDir"
+        return $embedExe
+    }
+    return $null
+}
+
 function Write-WAren6UnifyLater {
     param(
         [Parameter(Mandatory = $true)]
@@ -2687,18 +2973,25 @@ function Invoke-WAren6Unify {
         return $false
     }
 
-    & $pythonExe -c "import ccl_chromium_reader" 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        $wheelsDir = Join-Path $PSScriptRoot "wheels"
-        if (Test-Path -LiteralPath $wheelsDir) {
-            Write-WAren6Output "  [>] Installing Python dependency from local wheels..."
-            & $pythonExe -m pip install --quiet --no-index --find-links $wheelsDir ccl_chromium_reader 2>&1 | Out-Null
-        }
-        elseif ($OnlineBootstrap) {
-            Write-WAren6Output "  [>] Online bootstrap enabled; installing Python dependency..."
-            & $pythonExe -m pip install --quiet --user git+https://github.com/cclgroupltd/ccl_chromium_reader.git 2>&1 | Out-Null
+    $vendorDir = Join-Path $PSScriptRoot "vendor\ccl_chromium_reader"
+    if (Test-Path -LiteralPath $vendorDir) {
+        Write-WAren6Output "  [OK] Using vendored ccl_chromium_reader (zero pip dependencies)."
+    }
+    else {
+        & $pythonExe -c "import ccl_chromium_reader" 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            $wheelsDir = Join-Path $PSScriptRoot "wheels"
+            if (Test-Path -LiteralPath $wheelsDir) {
+                Write-WAren6Output "  [>] Installing Python dependency from local wheels..."
+                & $pythonExe -m pip install --quiet --no-index --find-links $wheelsDir ccl_chromium_reader 2>&1 | Out-Null
+            }
+            elseif ($OnlineBootstrap) {
+                Write-WAren6Output "  [>] Online bootstrap enabled; installing Python dependency..."
+                & $pythonExe -m pip install --quiet --user git+https://github.com/cclgroupltd/ccl_chromium_reader.git 2>&1 | Out-Null
+            }
         }
     }
+
 
     $scriptPath = Join-Path $PSScriptRoot "waren6.py"
     $unifyArgs = @(
@@ -2777,12 +3070,20 @@ function Invoke-WAren6Doctor {
     $wheelsDir = Join-Path $PSScriptRoot "wheels"
     $hasWheels = Test-Path -LiteralPath $wheelsDir -PathType Container
     if ($pythonExe) {
-        & $pythonExe -c "import ccl_chromium_reader" 2>$null
-        $hasCcl = $LASTEXITCODE -eq 0
-        $cclOk = $hasCcl -or $hasWheels -or (-not $NoNet)
-        $cclDetail = if ($hasCcl) { "available" } elseif ($hasWheels) { "missing; local wheels available" } elseif (-not $NoNet) { "missing; online bootstrap allowed" } else { "missing and --no-net is set" }
-        Add-DoctorCheck -Name "Python dependency ccl_chromium_reader" -Ok $cclOk -Detail $cclDetail
+        $vendorDir = Join-Path $PSScriptRoot "vendor\ccl_chromium_reader"
+        $hasVendored = Test-Path -LiteralPath $vendorDir -PathType Container
+        if ($hasVendored) {
+            Add-DoctorCheck -Name "Python dependency ccl_chromium_reader" -Ok $true -Detail "available (vendored in vendor/)"
+        }
+        else {
+            & $pythonExe -c "import ccl_chromium_reader" 2>$null
+            $hasCcl = $LASTEXITCODE -eq 0
+            $cclOk = $hasCcl -or $hasWheels -or (-not $NoNet)
+            $cclDetail = if ($hasCcl) { "available" } elseif ($hasWheels) { "missing; local wheels available" } elseif (-not $NoNet) { "missing; online bootstrap allowed" } else { "missing and --no-net is set" }
+            Add-DoctorCheck -Name "Python dependency ccl_chromium_reader" -Ok $cclOk -Detail $cclDetail
+        }
     }
+
 
     Add-DoctorCheck -Name "Offline wheels folder" -Ok ($hasWheels -or (-not $NoNet)) -Detail $(if ($hasWheels) { "available" } elseif ($NoNet) { "missing and --no-net is set" } else { "missing; online bootstrap allowed" })
     $embeddedPython = Join-Path $PSScriptRoot "python_embedded\python.exe"
@@ -2924,7 +3225,14 @@ function Invoke-WAren6WhatsAppRuntimeLaunch {
         [switch]$Silent
     )
 
-    Start-Process "explorer.exe" "shell:AppsFolder\5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App" -WindowStyle Hidden | Out-Null
+    $appId = if ($global:WhatsAppPackageFamilyName) {
+        "$($global:WhatsAppPackageFamilyName)!App"
+    }
+    else {
+        "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"
+    }
+
+    Start-Process "explorer.exe" "shell:AppsFolder\$appId" -WindowStyle Hidden | Out-Null
     if ($Silent) {
         Hide-WAren6WhatsAppWindows
         Start-Sleep -Milliseconds 500
@@ -3120,6 +3428,130 @@ function Invoke-WAren6CdpMethod {
     }
 }
 
+function Get-WAren6RuntimeReadinessBudgetSeconds {
+    param([switch]$DeepRuntime)
+    if ($DeepRuntime) { return 90 }
+    return 20
+}
+
+function Invoke-WAren6DevToolsProbe {
+    param(
+        [Parameter(Mandatory = $true)][int]$Port,
+        [Parameter(Mandatory = $false)][int]$TimeoutMilliseconds = 500
+    )
+
+    $effectiveProbeTimeoutMilliseconds = $TimeoutMilliseconds
+    $uri = "http://127.0.0.1:$Port/json/list"
+    $request = [System.Net.HttpWebRequest]::Create($uri)
+    $request.Proxy = $null
+    $request.Timeout = $TimeoutMilliseconds
+    $request.ReadWriteTimeout = $TimeoutMilliseconds
+    $response = $null
+    $reader = $null
+    try {
+        $response = [System.Net.HttpWebResponse]$request.GetResponse()
+        if ($response.StatusCode -ne [System.Net.HttpStatusCode]::OK) {
+            return [PSCustomObject]@{
+                status = "endpoint_http_error"
+                page = $null
+                httpStatus = [int]$response.StatusCode
+            }
+        }
+        $reader = [System.IO.StreamReader]::new($response.GetResponseStream(), [System.Text.Encoding]::UTF8)
+        $rawJson = $reader.ReadToEnd()
+        $targets = $null
+        try {
+            $targets = ConvertFrom-Json $rawJson
+        }
+        catch {
+            return [PSCustomObject]@{
+                status = "invalid_target_payload"
+                page = $null
+                httpStatus = [int]$response.StatusCode
+            }
+        }
+        $page = $targets | Where-Object { $_.type -eq "page" -and $_.url -match "web\.whatsapp\.com" } | Select-Object -First 1
+        if ($page) {
+            return [PSCustomObject]@{
+                status = "ready"
+                page = $page
+                httpStatus = [int]$response.StatusCode
+            }
+        }
+        return [PSCustomObject]@{
+            status = "no_web_whatsapp_target"
+            page = $null
+            httpStatus = [int]$response.StatusCode
+        }
+    }
+    catch [System.Net.WebException] {
+        $webEx = $_.Exception
+        if ($webEx.Status -eq [System.Net.WebExceptionStatus]::Timeout) {
+            return [PSCustomObject]@{ status = "endpoint_timeout"; page = $null; httpStatus = $null }
+        }
+        if ($webEx.Response) {
+            $code = $null
+            try { $code = [int](([System.Net.HttpWebResponse]$webEx.Response).StatusCode) } catch { }
+            return [PSCustomObject]@{ status = "endpoint_http_error"; page = $null; httpStatus = $code }
+        }
+        return [PSCustomObject]@{ status = "endpoint_unreachable"; page = $null; httpStatus = $null }
+    }
+    catch {
+        return [PSCustomObject]@{ status = "endpoint_unreachable"; page = $null; httpStatus = $null }
+    }
+    finally {
+        if ($reader) { $reader.Dispose() }
+        if ($response) { $response.Dispose() }
+    }
+}
+
+function Wait-WAren6DevToolsPage {
+    param(
+        [Parameter(Mandatory = $true)][int]$Port,
+        [Parameter(Mandatory = $false)][int]$ReadinessBudgetSeconds = 20,
+        [Parameter(Mandatory = $false)][int]$ProbeTimeoutMilliseconds = 500,
+        [Parameter(Mandatory = $false)][int]$PollMilliseconds = 250,
+        [Parameter(Mandatory = $false)][scriptblock]$MaintenanceAction = $null
+    )
+
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $budgetMs = $ReadinessBudgetSeconds * 1000
+    $lastProbe = $null
+    $attempts = 0
+
+    while ($watch.ElapsedMilliseconds -lt $budgetMs) {
+        $attempts++
+        if ($MaintenanceAction) {
+            & $MaintenanceAction
+        }
+        $remainingMs = [Math]::Max(50, [int]($budgetMs - $watch.ElapsedMilliseconds))
+        $timeoutMs = [Math]::Min($ProbeTimeoutMilliseconds, $remainingMs)
+        $lastProbe = Invoke-WAren6DevToolsProbe -Port $Port -TimeoutMilliseconds $timeoutMs
+        if ($lastProbe.status -eq "ready") {
+            return [PSCustomObject]@{
+                status = "ready"
+                page = $lastProbe.page
+                attempts = $attempts
+                elapsedMilliseconds = [int]$watch.ElapsedMilliseconds
+                httpStatus = $lastProbe.httpStatus
+            }
+        }
+        $sleepMs = [Math]::Min($PollMilliseconds, [Math]::Max(0, [int]($budgetMs - $watch.ElapsedMilliseconds)))
+        if ($sleepMs -gt 0) {
+            Start-Sleep -Milliseconds $sleepMs
+        }
+    }
+
+    $finalStatus = if ($lastProbe -and $lastProbe.status) { $lastProbe.status } else { "endpoint_timeout" }
+    return [PSCustomObject]@{
+        status = $finalStatus
+        page = $null
+        attempts = $attempts
+        elapsedMilliseconds = [int]$watch.ElapsedMilliseconds
+        httpStatus = if ($lastProbe) { $lastProbe.httpStatus } else { $null }
+    }
+}
+
 function Invoke-WAren6RuntimeStore8Capture {
     param(
         [Parameter(Mandatory = $true)]
@@ -3129,7 +3561,13 @@ function Invoke-WAren6RuntimeStore8Capture {
         [Parameter(Mandatory = $false)]
         [switch]$Silent,
         [Parameter(Mandatory = $false)]
-        [switch]$BlockClose
+        [switch]$BlockClose,
+        [Parameter(Mandatory = $false)]
+        [int]$ReadinessBudgetSeconds = 20,
+        [Parameter(Mandatory = $false)]
+        [switch]$DeepRuntime,
+        [Parameter(Mandatory = $false)]
+        [ref]$Diagnostics = $null
     )
 
     $runtimeDir = Join-Path $OutputDirectory "runtime"
@@ -3154,48 +3592,47 @@ function Invoke-WAren6RuntimeStore8Capture {
         }
         Set-ItemProperty -Path $regPath -Name $valueName -Value "--remote-debugging-port=$Port --remote-debugging-address=127.0.0.1" -Type String
 
-        Get-Process -Name "*WhatsApp*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        $running = Get-Process -Name "*WhatsApp*" -ErrorAction SilentlyContinue
+        if ($running) {
+            $running | Stop-Process -Force -ErrorAction SilentlyContinue
+            $exitWatch = [System.Diagnostics.Stopwatch]::StartNew()
+            while ((Get-Process -Name "*WhatsApp*" -ErrorAction SilentlyContinue) -and ($exitWatch.ElapsedMilliseconds -lt 5000)) {
+                Start-Sleep -Milliseconds 250
+            }
+            if (Get-Process -Name "*WhatsApp*" -ErrorAction SilentlyContinue) {
+                if ($Diagnostics) {
+                    $Diagnostics.Value = [PSCustomObject]@{
+                        status = "whatsapp_exit_timeout"
+                        attempts = 0
+                        elapsedMilliseconds = [int]$exitWatch.ElapsedMilliseconds
+                    }
+                }
+                throw "WhatsApp process exit timeout before relaunch"
+            }
+        }
+
         Invoke-WAren6WhatsAppRuntimeLaunch -Silent:$Silent
         if ($BlockClose -and -not $Silent) {
             Disable-WAren6WhatsAppClose
         }
 
-        # Poll the WebView2 DevTools endpoint 4x/second so we exit as soon as
-        # the page is up, but keep the window-hide / block-close side work
-        # capped at 1x/second so we don't hammer WhatsApp's UI. Overall
-        # 90-second budget is preserved.
-        $targets = $null
-        $page = $null
-        $deadline = [DateTime]::UtcNow.AddSeconds(90)
-        $lastMaintenanceUtc = [DateTime]::MinValue
-        while ([DateTime]::UtcNow -lt $deadline) {
-            $now = [DateTime]::UtcNow
-            if (($now - $lastMaintenanceUtc).TotalMilliseconds -ge 1000) {
-                if ($Silent) {
-                    Hide-WAren6WhatsAppWindows
-                }
-                elseif ($BlockClose) {
-                    $running = Get-Process -Name "*WhatsApp*" -ErrorAction SilentlyContinue
-                    if (-not $running) {
-                        Write-WAren6Output "  [>] WhatsApp closed during live capture; relaunching runtime..."
-                        Invoke-WAren6WhatsAppRuntimeLaunch -Silent:$Silent
-                    }
-                    Disable-WAren6WhatsAppClose
-                }
-                $lastMaintenanceUtc = $now
+        $effectiveBudget = if ($ReadinessBudgetSeconds) { $ReadinessBudgetSeconds } else { Get-WAren6RuntimeReadinessBudgetSeconds -DeepRuntime:$DeepRuntime }
+        $readiness = Wait-WAren6DevToolsPage `
+            -Port $Port `
+            -ReadinessBudgetSeconds $effectiveBudget `
+            -ProbeTimeoutMilliseconds 500 `
+            -PollMilliseconds 250 `
+            -MaintenanceAction {
+                if ($Silent) { Hide-WAren6WhatsAppWindows }
+                elseif ($BlockClose) { Disable-WAren6WhatsAppClose }
             }
-            try {
-                $targets = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/list" -TimeoutSec 2
-                $page = $targets | Where-Object { $_.type -eq "page" -and $_.url -match "web\.whatsapp\.com" } | Select-Object -First 1
-                if ($page) { break }
-            }
-            catch { }
-            $page = $null
-            Start-Sleep -Milliseconds 250
+        if ($Diagnostics) {
+            $Diagnostics.Value = $readiness
         }
-        if (-not $page) {
-            throw "WhatsApp WebView2 runtime did not expose a web.whatsapp.com DevTools page."
+        if ($readiness.status -ne "ready" -or -not $readiness.page) {
+            throw "WhatsApp WebView2 runtime did not expose a web.whatsapp.com DevTools page ($($readiness.status))."
         }
+        $page = $readiness.page
 
         $socket = [System.Net.WebSockets.ClientWebSocket]::new()
         [void]$socket.ConnectAsync([Uri]$page.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
@@ -3497,7 +3934,8 @@ function Get-WalSettingsData {
                 if ($kType -eq 8) { $kVal = 0; $kLen = 0 }
                 elseif ($kType -eq 9) { $kVal = 1; $kLen = 0 }
                 elseif ($kType -eq 1) { 
-                    $kVal = [int][sbyte]$bytes[$dataStart]
+                    $rawByte = [int]$bytes[$dataStart]
+                    $kVal = if ($rawByte -ge 128) { $rawByte - 256 } else { $rawByte }
                     $kLen = 1 
                 }
 
@@ -3615,6 +4053,13 @@ function Find-SqliteBlobCandidates {
 
         $headerEnd = $cursor + $headerSize
         if ($headerEnd -gt $EndOffset) { continue }
+
+        # Fast rejection: require at least one wanted type varint before allocating lists
+        $hasWantedVarint = $false
+        for ($k = $cursor + 1; $k -lt $headerEnd; $k++) {
+            if ($wanted.ContainsKey([int]$Bytes[$k])) { $hasWantedVarint = $true; break }
+        }
+        if (-not $hasWantedVarint) { continue }
 
         # Parse (headerSize - 1) column-type varints, single-byte only.
         # Any high bit set means multibyte varint -> skip conservatively.
@@ -3825,7 +4270,8 @@ function Find-SqliteSettingsRecords {
         if ($keyType -eq 8) { $keyVal = 0 }
         elseif ($keyType -eq 9) { $keyVal = 1 }
         elseif ($keyType -eq 1) {
-            $keyVal = [int][sbyte]$Bytes[$headerEnd + $keyDataOffset]
+            $rawByte = [int]$Bytes[$headerEnd + $keyDataOffset]
+            $keyVal = if ($rawByte -ge 128) { $rawByte - 256 } else { $rawByte }
         }
         if ($null -eq $keyVal -or $keyVal -lt 0 -or $keyVal -gt 10) { continue }
 
@@ -4042,7 +4488,11 @@ function Start-WAren6 {
         [Parameter(Mandatory = $false)]
         [switch]$Silent,
         [Parameter(Mandatory = $false)]
-        [switch]$ForegroundRuntime
+        [switch]$ForegroundRuntime,
+        [Parameter(Mandatory = $false)]
+        [switch]$NoArchive,
+        [Parameter(Mandatory = $false)]
+        [switch]$DeepRuntime
     )
     try {
         if (-not $Silent -and -not [Console]::IsOutputRedirected) {
@@ -4102,20 +4552,6 @@ public class ClipcWrapper {
         Write-Error "Error: BouncyCastle assembly not loaded. Make sure the BouncyCastle.Cryptography.dll is located in $PSScriptRoot."
         exit
     }
-    if (-not $PSBoundParameters.ContainsKey('WhatsAppPath')) {
-        $WhatsAppPath = Get-AppLocalStatePath -AppName "WhatsApp"
-        if ($null -eq $WhatsAppPath) {
-            Write-WAren6Output "  [!] WhatsApp installation path not found on this PC."
-            Write-WAren6Output "      Use the -WhatsApp argument to specify a standalone directory."
-            exit
-        }
-    }
-    
-    Write-WAren6Output ""
-    Write-WAren6Output "+------------------------------------------------------------+"
-    Write-WAren6Output "|                WAren6 Forensic Pipeline                 |"
-    Write-WAren6Output "+------------------------------------------------------------+"
-    Write-WAren6Output ""
     
     $globalWatch = [System.Diagnostics.Stopwatch]::StartNew()
     $sectionWatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -4149,8 +4585,10 @@ public class ClipcWrapper {
         New-Item -ItemType Directory -Force -Path $runtimeCaptureRoot | Out-Null
         $runtimeModeLabel = if ($runtimeHidden) { "hidden background" } else { "visible foreground" }
         Write-WAren6Output "  [>] Hybrid mode: capturing live Store 8 runtime supplement ($runtimeModeLabel)..."
+        $runtimeCaptureDiagnostics = $null
+        $effectiveReadinessBudget = Get-WAren6RuntimeReadinessBudgetSeconds -DeepRuntime:$DeepRuntime
         try {
-            $runtimeCapturedJsonl = Invoke-WAren6RuntimeStore8Capture -OutputDirectory $runtimeCaptureRoot -Silent:$runtimeHidden -BlockClose:$ForegroundRuntime
+            $runtimeCapturedJsonl = Invoke-WAren6RuntimeStore8Capture  -OutputDirectory $runtimeCaptureRoot -Silent:$runtimeHidden -BlockClose:$ForegroundRuntime -ReadinessBudgetSeconds $effectiveReadinessBudget -DeepRuntime:$DeepRuntime -Diagnostics ([ref]$runtimeCaptureDiagnostics)
             $modeInfo.runtimeSupplement = [PSCustomObject]@{
                 path = $null
                 stagedPath = $runtimeCapturedJsonl
@@ -4159,6 +4597,7 @@ public class ClipcWrapper {
                 usableRecords = $null
                 recordsWithText = $null
                 warnings = @()
+                readiness = $runtimeCaptureDiagnostics
             }
             $modeInfo.networkSideEffects += $(if ($runtimeHidden) { "whatsapp_runtime_opened_hidden" } else { "whatsapp_runtime_opened_visible" })
             if (Test-WAren6RuntimeJsonl -Path $runtimeCapturedJsonl) {
@@ -4178,6 +4617,7 @@ public class ClipcWrapper {
                 usableRecords = $null
                 recordsWithText = $null
                 warnings = @($_.Exception.Message)
+                readiness = $runtimeCaptureDiagnostics
             }
             Write-Warning "Hybrid runtime capture failed: $($_.Exception.Message). Continuing with offline extraction."
         }
@@ -4228,15 +4668,15 @@ public class ClipcWrapper {
                 $modeInfo.runtimeSupplement.status = "preserved"
             }
             Write-WAren6Output "  [>] Runtime Store 8 supplement preserved in case folder."
-            if ($runtimeCaptureRoot -and (Test-Path -LiteralPath $runtimeCaptureRoot)) {
-                Remove-Item -LiteralPath $runtimeCaptureRoot -Force -Recurse -ErrorAction SilentlyContinue
-            }
         }
         else {
             if ($modeInfo.runtimeSupplement) {
                 $modeInfo.runtimeSupplement.status = "captured_unusable"
             }
             Write-Warning "Runtime Store 8 supplement was not preserved because the staged JSONL was missing or empty."
+        }
+        if ($runtimeCaptureRoot -and (Test-Path -LiteralPath $runtimeCaptureRoot)) {
+            Remove-Item -LiteralPath $runtimeCaptureRoot -Force -Recurse -ErrorAction SilentlyContinue
         }
         Write-WAren6StepTiming -Label "Runtime supplement preservation" -Stopwatch $acquisitionStepWatch
     }
@@ -4629,187 +5069,26 @@ public class ClipcWrapper {
     }
     elseif ((Test-Path $waExtractScript) -and $idbDest -and (Test-Path $idbDest)) {
 
-        # -- Helper: Resolve a working Python executable -----------------------
-        # Returns the path to a working python.exe, or $null if none found.
-        function Resolve-PythonExe {
-            # Strategy 1: python already on PATH
-            $candidates = @("python", "python3", "py")
-            foreach ($cmd in $candidates) {
-                try {
-                    $ver = & $cmd --version 2>&1
-                    if ($LASTEXITCODE -eq 0 -and $ver -match 'Python\s+3\.') {
-                        Write-Host "  Found system Python: $ver"
-                        return $cmd
-                    }
-                }
-                catch { }
-            }
-
-            # Strategy 2: Common installation paths (user + system)
-            $knownPaths = @(
-                "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe",
-                "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe",
-                "C:\Python3*\python.exe",
-                "C:\Python*\python.exe",
-                "$env:ProgramFiles\Python3*\python.exe",
-                "$env:ProgramFiles\Python*\python.exe"
-            )
-            foreach ($glob in $knownPaths) {
-                $found = Get-ChildItem -Path $glob -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
-                if ($found) {
-                    try {
-                        $ver = & $found.FullName --version 2>&1
-                        if ($LASTEXITCODE -eq 0 -and $ver -match 'Python\s+3\.') {
-                            Write-Host "  Found Python at: $($found.FullName)"
-                            return $found.FullName
-                        }
-                    }
-                    catch { }
-                }
-            }
-
-            return $null
-        }
-
-        # -- Helper: Silent Python install (no GUI, no popups) -----------------
-        function Install-PythonSilently {
-            $pyVersion = "3.12.4"
-            $installerUrl = "https://www.python.org/ftp/python/$pyVersion/python-$pyVersion-amd64.exe"
-            $installerPath = Join-Path $env:TEMP "python-$pyVersion-installer.exe"
-
-            Write-Host "  Downloading Python $pyVersion installer..."
-            try {
-                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                $wc = New-Object System.Net.WebClient
-                $wc.DownloadFile($installerUrl, $installerPath)
-            }
-            catch {
-                Write-Warning "  Failed to download Python installer: $($_.Exception.Message)"
-                return $false
-            }
-
-            if (-not (Test-Path $installerPath)) {
-                Write-Warning "  Python installer was not downloaded."
-                return $false
-            }
-
-            Write-Host "  Installing Python silently (this may take a moment)..."
-            try {
-                # /quiet = no GUI, InstallAllUsers=1 = system-wide, PrependPath=1 = add to PATH
-                $proc = Start-Process -FilePath $installerPath `
-                    -ArgumentList "/quiet", "InstallAllUsers=1", "PrependPath=1", "Include_pip=1", "Include_test=0" `
-                    -Wait -PassThru -NoNewWindow -ErrorAction Stop
-                if ($proc.ExitCode -ne 0) {
-                    Write-Warning "  Python installer exited with code $($proc.ExitCode)."
-                    return $false
-                }
-            }
-            catch {
-                Write-Warning "  Failed to run Python installer: $($_.Exception.Message)"
-                return $false
-            }
-            finally {
-                Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-            }
-
-            # Refresh PATH in current session so we can find the new install
-            $machinePath = [System.Environment]::GetEnvironmentVariable("PATH", "Machine")
-            $userPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
-            $env:PATH = "$machinePath;$userPath"
-
-            Write-Host "  Python $pyVersion installed successfully."
-            return $true
-        }
-
-        # -- Helper: Embedded/portable Python fallback -------------------------
-        function Get-EmbeddedPython {
-            $embedVersion = "3.12.4"
-            $embedZipUrl = "https://www.python.org/ftp/python/$embedVersion/python-$embedVersion-embed-amd64.zip"
-            $embedDir = Join-Path $PSScriptRoot "python_embedded"
-            $embedExe = Join-Path $embedDir "python.exe"
-
-            if (Test-Path $embedExe) {
-                Write-Host "  Using existing embedded Python at: $embedDir"
-                return $embedExe
-            }
-
-            if (-not $OnlineBootstrap) {
-                Write-Warning "  Embedded Python not found and online bootstrap is disabled."
-                return $null
-            }
-
-            Write-Host "  Downloading embedded Python $embedVersion..."
-            $zipPath = Join-Path $env:TEMP "python-embed-amd64.zip"
-            try {
-                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                $wc = New-Object System.Net.WebClient
-                $wc.DownloadFile($embedZipUrl, $zipPath)
-            }
-            catch {
-                Write-Warning "  Failed to download embedded Python: $($_.Exception.Message)"
-                return $null
-            }
-
-            Write-Host "  Extracting embedded Python..."
-            try {
-                New-Item -ItemType Directory -Force -Path $embedDir | Out-Null
-                Add-Type -AssemblyName System.IO.Compression.FileSystem
-                [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $embedDir)
-            }
-            catch {
-                Write-Warning "  Failed to extract embedded Python: $($_.Exception.Message)"
-                Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-                return $null
-            }
-            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-
-            # Enable pip in embedded Python (uncomment the import site line in pth file)
-            $pthFile = Get-ChildItem "$embedDir\python*._pth" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($pthFile) {
-                $content = Get-Content $pthFile.FullName
-                $content = $content -replace '#\s*import site', 'import site'
-                Set-Content -Path $pthFile.FullName -Value $content
-            }
-
-            # Bootstrap pip
-            $getPipUrl = "https://bootstrap.pypa.io/get-pip.py"
-            $getPipPath = Join-Path $embedDir "get-pip.py"
-            try {
-                (New-Object System.Net.WebClient).DownloadFile($getPipUrl, $getPipPath)
-                & $embedExe $getPipPath --no-warn-script-location 2>&1 | Out-Null
-                Remove-Item $getPipPath -Force -ErrorAction SilentlyContinue
-            }
-            catch {
-                Write-Warning "  Failed to bootstrap pip for embedded Python: $($_.Exception.Message)"
-            }
-
-            if (Test-Path $embedExe) {
-                Write-Host "  Embedded Python ready at: $embedDir"
-                return $embedExe
-            }
-            return $null
-        }
-
         $sectionWatch.Stop()
         Write-WAren6Output "+-- (Completed in $($sectionWatch.Elapsed.TotalSeconds.ToString('F1'))s) ----------------------------------+"
         Write-WAren6Output ""
         $sectionWatch.Restart()
         Write-WAren6Output "+-- [3/4] Unified Database Extractor ------------------------+"
         Write-WAren6Output "  [>] Resolving Python environment..."
-        $pythonExe = Resolve-PythonExe
+        $pythonExe = Resolve-WAren6PythonExe
 
         if (-not $pythonExe -and $OnlineBootstrap) {
             Write-WAren6Output "  [>] Python not found on PATH. Attempting silent download/installation..."
-            $installOk = Install-PythonSilently
+            $installOk = Install-WAren6PythonSilently
             if ($installOk) {
-                $pythonExe = Resolve-PythonExe
+                $pythonExe = Resolve-WAren6PythonExe
             }
         }
 
         if (-not $pythonExe) {
             Write-WAren6Output "  [!] System Python unavailable."
             Write-WAren6Output "  [>] Trying embedded Python..."
-            $pythonExe = Get-EmbeddedPython
+            $pythonExe = Get-WAren6EmbeddedPython -OnlineBootstrap:$OnlineBootstrap
         }
 
         if (-not $pythonExe) {
@@ -4818,32 +5097,39 @@ public class ClipcWrapper {
             Write-WAren6UnifyLater -CasePath $targetOutput -WithMedia:$WithMedia | Out-Null
         }
         else {
-            # -- Ensure ccl_chromium_reader dependency is installed -------------
-            Write-WAren6Output "  [>] Verifying dependencies (ccl_chromium_reader)..."
-            & $pythonExe -c "import ccl_chromium_reader" 2>$null
-            if ($LASTEXITCODE -ne 0) {
-                $wheelsDir = Join-Path $PSScriptRoot "wheels"
-                if (Test-Path -LiteralPath $wheelsDir) {
-                    Write-WAren6Output "  [>] Missing dependency. Installing from local wheels..."
-                    & $pythonExe -m pip install --quiet --no-index --find-links $wheelsDir ccl_chromium_reader 2>&1 | Out-Null
-                }
-                elseif ($OnlineBootstrap) {
-                    Write-WAren6Output "  [!] Missing dependency. Online bootstrap enabled; installing from source..."
-                    & $pythonExe -m pip install --quiet --user git+https://github.com/cclgroupltd/ccl_chromium_reader.git 2>&1 | Out-Null
-                }
-                else {
-                    Write-Warning "ccl_chromium_reader is missing and no local wheels directory exists. Unified DB will not be built."
-                    $pythonExe = $null
-                }
-
-                if ($pythonExe) {
-                    & $pythonExe -c "import ccl_chromium_reader" 2>$null
-                }
+            $vendorDir = Join-Path $PSScriptRoot "vendor\ccl_chromium_reader"
+            if (Test-Path -LiteralPath $vendorDir) {
+                Write-WAren6Output "  [OK] Using vendored ccl_chromium_reader (zero pip dependencies)."
+            }
+            else {
+                # -- Ensure ccl_chromium_reader dependency is installed -------------
+                Write-WAren6Output "  [>] Verifying dependencies (ccl_chromium_reader)..."
+                & $pythonExe -c "import ccl_chromium_reader" 2>$null
                 if ($LASTEXITCODE -ne 0) {
-                    Write-Warning "Failed to load ccl_chromium_reader. Unified DB will not be built."
-                    $pythonExe = $null
+                    $wheelsDir = Join-Path $PSScriptRoot "wheels"
+                    if (Test-Path -LiteralPath $wheelsDir) {
+                        Write-WAren6Output "  [>] Missing dependency. Installing from local wheels..."
+                        & $pythonExe -m pip install --quiet --no-index --find-links $wheelsDir ccl_chromium_reader 2>&1 | Out-Null
+                    }
+                    elseif ($OnlineBootstrap) {
+                        Write-WAren6Output "  [!] Missing dependency. Online bootstrap enabled; installing from source..."
+                        & $pythonExe -m pip install --quiet --user git+https://github.com/cclgroupltd/ccl_chromium_reader.git 2>&1 | Out-Null
+                    }
+                    else {
+                        Write-Warning "ccl_chromium_reader is missing and no local wheels directory exists. Unified DB will not be built."
+                        $pythonExe = $null
+                    }
+
+                    if ($pythonExe) {
+                        & $pythonExe -c "import ccl_chromium_reader" 2>$null
+                    }
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Warning "Failed to load ccl_chromium_reader. Unified DB will not be built."
+                        $pythonExe = $null
+                    }
                 }
             }
+
         }
 
         $pythonAttempted = $false
@@ -5002,25 +5288,31 @@ public class ClipcWrapper {
             -PrecomputedFiles $caseFileInventory | Out-Null
     }
 
-    Write-WAren6Output "  [>] Compressing extraction directory..."
-    try {
-        $archiveInfo = New-WAren6CaseArchive -Source $targetOutput -OutputDirectory $OutputDirectory -BaseName $archiveBaseName
-        $archivePath = $archiveInfo.Path
-        Write-WAren6Output "  [OK] Archive generated: $(Split-Path -Path $archivePath -Leaf)"
+    if ($NoArchive) {
+        Write-WAren6Output "  [>] --no-archive set; retaining case folder without archive."
+        $checksumFileArchive = "skipped (--no-archive)"
     }
-    catch {
-        Write-Error "Archive creation failed: $($_.Exception.Message)"
-        Stop-WAren6Log
-        return
-    }
+    else {
+        Write-WAren6Output "  [>] Compressing extraction directory..."
+        try {
+            $archiveInfo = New-WAren6CaseArchive -Source $targetOutput -OutputDirectory $OutputDirectory -BaseName $archiveBaseName
+            $archivePath = $archiveInfo.Path
+            Write-WAren6Output "  [OK] Archive generated: $(Split-Path -Path $archivePath -Leaf)"
+        }
+        catch {
+            Write-Error "Archive creation failed: $($_.Exception.Message)"
+            Stop-WAren6Log
+            return
+        }
 
-    # Generate integrity HASH
-    Write-WAren6Output "  [>] Calculating SHA-256 Checksum..."
-    $checksumFileArchive = Get-SHA256Checksum -FilePath $archivePath -Sha256Hash $archiveInfo.Sha256
-    if ($checksumFileArchive) {
-        Write-Verbose "Checksum file (archive): $checksumFileArchive"
+        # Generate integrity HASH
+        Write-WAren6Output "  [>] Calculating SHA-256 Checksum..."
+        $checksumFileArchive = Get-SHA256Checksum -FilePath $archivePath -Sha256Hash $archiveInfo.Sha256
+        if ($checksumFileArchive) {
+            Write-Verbose "Checksum file (archive): $checksumFileArchive"
+        }
+        Write-WAren6Output "  [OK] SHA-256: $checksumFileArchive"
     }
-    Write-WAren6Output "  [OK] SHA-256: $checksumFileArchive"
 
     if (Test-Path -LiteralPath $targetOutput) {
         Sync-WAren6CaseLog -CasePath $targetOutput | Out-Null
@@ -5102,13 +5394,14 @@ public class ClipcWrapper {
     if ($pythonFailed) {
         Write-Warning "Unified DB was not completed. Keeping extracted case folder for inspection and re-run."
     }
-    if ($DeleteCaseDirectoryAfterArchive -and -not $pythonFailed -and -not ($TelegramAutoDelete -and $telegramResult.success)) {
+    if ($DeleteCaseDirectoryAfterArchive -and -not $pythonFailed -and -not $NoArchive -and -not [string]::IsNullOrEmpty($archivePath) -and -not ($TelegramAutoDelete -and $telegramResult.success)) {
         Sync-WAren6CaseLog -CasePath $targetOutput | Out-Null
         $caseDirectoryRemoved = Remove-WAren6CaseDirectoryAfterArchive -CasePath $targetOutput -ArchivePath $archivePath
         if ($caseDirectoryRemoved) {
             Write-WAren6Output "  [OK] Cleaned extracted case folder after verified archive."
         }
     }
+
 
     # NOTE: WhatsApp restart disabled to avoid new window spawning
     if ($wasWhatsAppRunning) {
@@ -5256,7 +5549,7 @@ elseif ($RuntimeOnly) {
     New-Item -ItemType Directory -Force -Path $CasePath | Out-Null
     try {
         $runtimeHidden = -not $ForegroundRuntime
-        $runtimePath = Invoke-WAren6RuntimeStore8Capture -OutputDirectory $CasePath -Silent:$runtimeHidden -BlockClose:$ForegroundRuntime
+        $runtimePath = Invoke-WAren6RuntimeStore8Capture -OutputDirectory $CasePath -Silent:$runtimeHidden -BlockClose:$ForegroundRuntime -DeepRuntime:$DeepRuntime
         Write-WAren6Output "Runtime Store 8 JSONL: $runtimePath"
         exit 0
     }
@@ -5281,8 +5574,31 @@ elseif ($PSBoundParameters.ContainsKey('GetID')) {
 }
 
 else {
+    if ($PSBoundParameters.Count -eq 0 -and [Environment]::UserInteractive) {
+        Write-Host "=================================================" -ForegroundColor Cyan
+        Write-Host "         WAren6 WhatsApp Forensic Toolkit        " -ForegroundColor Cyan
+        Write-Host "=================================================" -ForegroundColor Cyan
+        $detectedWa = Get-AppLocalStatePath -AppName "WhatsApp"
+        if ($detectedWa) {
+            Write-Host "  WhatsApp Status : Detected on this system" -ForegroundColor Green
+        } else {
+            Write-Host "  WhatsApp Status : Not detected in default path" -ForegroundColor Yellow
+        }
+        Write-Host "  Operating Mode  : Standard Acquisition & Unify" -ForegroundColor White
+        Write-Host "  Output Directory: $PWD" -ForegroundColor White
+        Write-Host "-------------------------------------------------" -ForegroundColor DarkGray
+        Write-Host "Press [Enter] to start extraction with safe defaults..." -NoNewline -ForegroundColor Yellow
+        $null = Read-Host
+        Write-Host ""
+    }
+
+    if ($NoArchive -and ($TelegramBotToken -or $TelegramAutoDelete)) {
+        Write-WAren6Output "Cannot combine --no-archive with Telegram transfer or auto-delete."
+        exit 1
+    }
     if (-not $PSBoundParameters.ContainsKey('WhatsAppPath')) {
         $WhatsAppPath = Get-AppLocalStatePath -AppName "WhatsApp"
+
         if ($null -eq $WhatsAppPath) {
             Write-WAren6Output "WhatsApp installation path not found on this PC. If you are attempting to process a standalone directory structure, please use the -WhatsApp argument."
             exit
@@ -5331,6 +5647,8 @@ else {
         -AcquireOnly:$AcquireOnly `
         -GenerateReports:$GenerateReports `
         -Silent:$Silent `
-        -ForegroundRuntime:$ForegroundRuntime
+        -ForegroundRuntime:$ForegroundRuntime `
+        -NoArchive:$NoArchive `
+        -DeepRuntime:$DeepRuntime
 }
 
