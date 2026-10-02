@@ -6,6 +6,8 @@ param (
     [Parameter(Mandatory = $false)]
     [switch]$Offline,
     [Parameter(Mandatory = $false)]
+    [switch]$PreservedCopy,
+    [Parameter(Mandatory = $false)]
     [Alias('i')]
     [string]$ID,
     [Parameter(Mandatory = $false)]
@@ -165,6 +167,7 @@ function Import-WAren6LongOptions
         "visible-runtime" = "ForegroundRuntime"
         "show-whatsapp" = "ForegroundRuntime"
         "show-wa" = "ForegroundRuntime"
+        "preserved-copy" = "PreservedCopy"
         "offline" = "OfflineMode"
         "offline-only" = "OfflineMode"
         "media" = "WithMedia"
@@ -319,6 +322,30 @@ elseif (-not $Doctor -and -not $PSBoundParameters.ContainsKey('OnlineBootstrap')
     Set-WAren6CliSwitch -Name "OnlineBootstrap"
 }
 
+if ($PreservedCopy) {
+    if (-not $OfflineMode -or $RuntimeOnly -or $GetID -or $Doctor -or $UnifyOnly -or $DeepRuntime -or $ForegroundRuntime) {
+        throw 'PreservedCopy requires offline extraction and prohibits runtime actions.'
+    }
+    if (-not $PSBoundParameters.ContainsKey('WhatsAppPath') -or -not $WhatsAppPath) {
+        throw 'PreservedCopy requires an explicit copied LocalState directory.'
+    }
+    $preservedSource = (Resolve-Path -LiteralPath $WhatsAppPath -ErrorAction Stop).Path
+    $preservedRoot = Split-Path $preservedSource -Parent
+    $livePackages = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Packages')).TrimEnd('\') + '\'
+    if ($preservedSource.StartsWith($livePackages, [StringComparison]::OrdinalIgnoreCase) -or (Split-Path $preservedSource -Leaf) -ne 'LocalState') {
+        throw 'PreservedCopy source must be copied LocalState evidence outside live app packages.'
+    }
+    foreach ($relative in @('LocalState', 'LocalCache\EBWebView\Default\IndexedDB', 'LocalCache\EBWebView\Default\Local Storage')) {
+        $copiedDirectory = Join-Path $preservedRoot $relative
+        if (-not (Test-Path -LiteralPath $copiedDirectory -PathType Container)) { throw "Missing preserved evidence: $relative" }
+    }
+    $probe = Get-Item -LiteralPath $preservedSource
+    while ($probe) {
+        if (($probe.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'PreservedCopy forbids linked evidence paths.' }
+        $probe = $probe.Parent
+    }
+    $WhatsAppPath = $preservedSource
+}
 function Test-WAren6ColorOutput {
     if ($env:NO_COLOR) {
         return $false
@@ -4457,6 +4484,8 @@ function Start-WAren6 {
         [Parameter(Mandatory = $false)]
         [switch]$OfflineMode,
         [Parameter(Mandatory = $false)]
+        [switch]$PreservedCopy,
+        [Parameter(Mandatory = $false)]
         [switch]$DeleteCaseDirectoryAfterArchive,
         [Parameter(Mandatory = $false)]
         [string]$TelegramBotToken,
@@ -4624,6 +4653,11 @@ public class ClipcWrapper {
         Write-WAren6StepTiming -Label "Runtime capture" -Stopwatch $acquisitionStepWatch
     }
     
+    $wasWhatsAppRunning = $false
+    if ($PreservedCopy) {
+        Write-WAren6Output '  [OK] Processing preserved evidence; WhatsApp remains open.'
+    }
+    else {
     # Close WhatsApp to release file locks on databases
     $whatsAppProcesses = Get-Process -Name "*WhatsApp*" -ErrorAction SilentlyContinue
     $wasWhatsAppRunning = $false
@@ -4650,6 +4684,8 @@ public class ClipcWrapper {
     }
     Write-WAren6StepTiming -Label "WhatsApp shutdown" -Stopwatch $acquisitionStepWatch
     
+    }
+
     $localStateExcludes = @()
     if (-not $WithMedia) {
         $localStateExcludes += "transfers"
@@ -5627,6 +5663,7 @@ else {
     }
     Start-WAren6 `
         -WhatsAppPath $WhatsAppPath `
+        -PreservedCopy:$PreservedCopy `
         -UseSuppliedODUID:$script:WAren6UseSuppliedODUID `
         -ID $ID `
         -OutputPath $OutputDirectory `
@@ -5651,4 +5688,3 @@ else {
         -NoArchive:$NoArchive `
         -DeepRuntime:$DeepRuntime
 }
-
