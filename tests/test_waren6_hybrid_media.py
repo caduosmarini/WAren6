@@ -11,6 +11,49 @@ import waren6
 
 
 class UnifiedSchemaPerformanceTests(unittest.TestCase):
+    def test_quote_enrichment_uses_reply_index_and_preserves_quote_semantics(self):
+        source = Path(waren6.__file__).read_text(encoding="utf-8")
+        quote_start = source.index("# ── Enrich quoted-message bodies")
+        quote_source = source[quote_start:source.index("# ── Deduplicate only stable IndexedDB key duplicates", quote_start)]
+        sql = re.search(r'cursor.execute\("""(.*?)"""\)', quote_source, re.S).group(1)
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(waren6.UNIFIED_TABLE_SCHEMA)
+            conn.executemany(
+                """INSERT INTO messages(msg_id, chat_jid, timestamp, text, msg_type,
+                   quoted_stanza_id, quoted_msg_body, quoted_msg_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    ("original", "a@c.us", 20, "later", "video", None, None, None),
+                    ("original", "a@c.us", 10, "earliest", "chat", None, None, None),
+                    ("original", "a@c.us", 10, "same-time later row", "image", None, None, None),
+                    ("original", "b@c.us", 1, "other chat", "audio", None, None, None),
+                    ("reply", "a@c.us", 30, "reply", "chat", "original", None, None),
+                    ("blank-preview", "a@c.us", 31, "reply", "chat", "original", "  ", "image"),
+                    ("captured-preview", "a@c.us", 32, "reply", "chat", "original", "captured snapshot", "video"),
+                    ("other-reply", "b@c.us", 33, "reply", "chat", "original", None, None),
+                    ("missing", "a@c.us", 34, "reply", "chat", "absent", None, None),
+                ],
+            )
+            waren6.create_unified_indexes(conn)
+            plan = "\n".join(str(row) for row in conn.execute("EXPLAIN QUERY PLAN " + sql))
+            self.assertIn("idx_messages_chat_quote", plan)
+            conn.execute(sql)
+            previews = dict(
+                (row[0], row[1:]) for row in conn.execute(
+                    "SELECT msg_id, quoted_msg_body, quoted_msg_type FROM messages WHERE quoted_stanza_id IS NOT NULL"
+                )
+            )
+            self.assertEqual(previews["reply"], ("earliest", "chat"))
+            self.assertEqual(previews["blank-preview"], ("earliest", "image"))
+            self.assertEqual(previews["captured-preview"], ("captured snapshot", "video"))
+            self.assertEqual(previews["other-reply"], ("other chat", "audio"))
+            self.assertEqual(previews["missing"], (None, None))
+            # Reapplying index creation is safe for an existing generated case.
+            waren6.create_unified_indexes(conn)
+        finally:
+            conn.close()
+
     def test_schema_foreign_key_check_allows_intentional_duplicate_message_keys(self):
         conn = sqlite3.connect(":memory:")
         try:

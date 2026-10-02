@@ -197,6 +197,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, timestamp)
 CREATE INDEX IF NOT EXISTS idx_messages_msg_key ON messages(msg_key);
 CREATE INDEX IF NOT EXISTS idx_messages_msgid_ts ON messages(msg_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_chat_msgid_ts ON messages(chat_jid, msg_id, timestamp);
+-- The quote-enrichment join searches reply rows by the original's chat/id.
+-- Index only replies so large chats do not get rescanned for every original.
+CREATE INDEX IF NOT EXISTS idx_messages_chat_quote ON messages(chat_jid, quoted_stanza_id) WHERE quoted_stanza_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_jid);
 CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(msg_type);
@@ -346,7 +349,7 @@ UNIFIED_TABLE_SCHEMA, UNIFIED_INDEX_SCHEMA = split_unified_schema(UNIFIED_SCHEMA
 def create_unified_indexes(conn):
     """Create query indexes after bulk inserts to avoid per-row index churn.
 
-    Wraps all 18 CREATE INDEX statements in one BEGIN/COMMIT so the pager
+    Wraps all CREATE INDEX statements in one BEGIN/COMMIT so the pager
     cache stays warm across statements — journal_mode=MEMORY is already
     the writer default, so this is a cache-locality win, not an fsync win.
     Temporarily raises PRAGMA cache_size to 256 MiB for the index build,
