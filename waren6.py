@@ -34,6 +34,7 @@ import re
 import shutil
 import sqlite3
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -174,6 +175,13 @@ CREATE TABLE IF NOT EXISTS messages (
     media_mime_type     TEXT,
     media_filename      TEXT,
     media_size          INTEGER,
+    -- Private acquisition metadata. Hashes identify content, not filenames.
+    media_filehash      TEXT,
+    media_enc_filehash  TEXT,
+    media_key           TEXT,
+    media_direct_path   TEXT,
+    media_url           TEXT,
+    media_duration      INTEGER,
     -- Source provenance for forensic audit/replay
     source              TEXT,
     source_id           TEXT,
@@ -2735,6 +2743,142 @@ def normalize_source_text_for_validation(text):
 
 
 
+MEDIA_ACQUISITION_COLUMNS = {
+    "media_filehash": "TEXT", "media_enc_filehash": "TEXT", "media_key": "TEXT",
+    "media_direct_path": "TEXT", "media_url": "TEXT", "media_duration": "INTEGER",
+}
+
+
+def media_digest_bytes(value):
+    """Read a 32-byte WhatsApp hash/key without logging the sensitive value."""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value) if len(value) == 32 else None
+    if isinstance(value, (list, tuple)) and len(value) == 32 and all(
+            type(v) is int and 0 <= v <= 255 for v in value):
+        return bytes(value)
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if re.fullmatch(r"[a-fA-F0-9]{64}", value):
+        return bytes.fromhex(value)
+    try:
+        value = value.replace("-", "+").replace("_", "/")
+        decoded = base64.b64decode(value + "=" * (-len(value) % 4), validate=True)
+        return decoded if len(decoded) == 32 else None
+    except (ValueError, binascii.Error):
+        return None
+
+
+def media_acquisition_metadata(record, supplement=None):
+    """Preserve exact-message acquisition data from Store 8/runtime records."""
+    sources = [r for r in (record, supplement) if isinstance(r, dict)]
+
+    def pick(*names):
+        return next((r[name] for r in sources for name in names
+                     if r.get(name) is not None and safe_str(r.get(name)) is not None), None)
+
+    def digest(*names):
+        return next((decoded for r in sources for name in names
+                     if (decoded := media_digest_bytes(r.get(name))) is not None), None)
+
+    filehash = digest("filehash", "media_filehash")
+    enc_hash = digest("encFilehash", "enc_filehash", "media_enc_filehash")
+    key = digest("mediaKey", "media_key")
+    return (
+        filehash.hex() if filehash else None,
+        enc_hash.hex() if enc_hash else None,
+        base64.b64encode(key).decode("ascii") if key else None,
+        safe_str(pick("directPath", "direct_path", "media_direct_path")),
+        safe_str(pick("staticUrl", "static_url", "deprecatedMms3Url", "deprecated_mms3_url", "media_url")),
+        safe_int(pick("duration", "media_duration")),
+    )
+
+
+def ensure_media_acquisition_columns(conn):
+    """Upgrade a retained case for media-only indexing, without rebuilding it."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    for name, sql_type in MEDIA_ACQUISITION_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {name} {sql_type}")
+
+
+def audio_acquisition_cutoff(now=None):
+    """Use an explicitly selected backfill epoch, retaining the routine default."""
+    now = int(time.time()) if now is None else int(now)
+    default = now - 7 * 86400
+    value = os.environ.get("WHATMCP_AUDIO_BACKFILL_AFTER")
+    if value is None:
+        return default
+    try:
+        cutoff = int(value)
+    except (ValueError, TypeError):
+        return default
+    return cutoff if 0 < cutoff <= now else default
+
+
+def acquire_audio_from_private_metadata(output_path, metadata_batch):
+    """Use the fixed local WhatMCP decoder through a pipe, without storing keys."""
+    if os.environ.get("WHATMCP_AUDIO_ACQUISITION_ENABLED") != "1" or not metadata_batch:
+        return
+    project = pathlib.Path(__file__).resolve().parent.parent
+    script = project / "whatmcp" / "scripts" / "acquire-windows-audio.ts"
+    node = pathlib.Path("C:/Program Files/nodejs/node.exe")
+    # Only this reviewed repository helper may receive private metadata.
+    if not node.is_file() or not script.is_file() or script.is_symlink() or not script.resolve().is_relative_to(project):
+        print("  Audio acquisition skipped: fixed local runtime unavailable")
+        return
+    now = int(time.time())
+    cutoff = audio_acquisition_cutoff(now)
+    try:
+        explicit_after = int(os.environ.get("WHATMCP_AUDIO_BACKFILL_AFTER", "0"))
+    except (ValueError, TypeError):
+        explicit_after = 0
+    limit = 2000 if 0 < explicit_after <= now else 200
+    try:
+        source = sqlite3.connect(pathlib.Path(output_path).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            eligible = source.execute("""
+                SELECT msg_id,chat_jid FROM messages
+                WHERE msg_type IN ('audio','ptt') AND media_case_path IS NULL
+                    AND media_filehash IS NOT NULL AND timestamp>=?
+                ORDER BY timestamp DESC,rowid DESC LIMIT ?
+            """, (cutoff, limit)).fetchall()
+        finally:
+            source.close()
+    except sqlite3.Error:
+        print("  Audio acquisition skipped: source metadata unavailable")
+        return
+    by_identity = {}
+    for metadata in metadata_batch:
+        msg_key, chat_jid = metadata[6:]
+        _, _, msg_id, _ = parse_msg_key(msg_key)
+        if msg_id:
+            by_identity[(msg_id, chat_jid)] = {"msg_id": msg_id, "chat_jid": chat_jid,
+                "media_key": metadata[2], "media_direct_path": metadata[3], "media_url": metadata[4]}
+    rows = [by_identity[(msg_id, chat_jid)] for msg_id, chat_jid in eligible
+            if (msg_id, chat_jid) in by_identity]
+    if not rows:
+        return
+    try:
+        result = subprocess.run(
+            [str(node), "--experimental-sqlite", "--experimental-strip-types", "--no-warnings",
+             str(script), "--source=" + str(output_path), "--metadata-stdin"],
+            input=json.dumps(rows), text=True, encoding="utf-8",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=150,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0:
+            print("  Audio acquisition incomplete; original message history preserved")
+            return
+        summary = json.loads(result.stdout.strip().splitlines()[-1])
+        # Child stdout/stderr are never forwarded: logs contain only counters.
+        counts = {name: value for name, value in summary.items()
+                  if name in ("downloaded", "reused", "failed", "eligible") and type(value) is int}
+        print("  Audio acquisition: " + json.dumps(counts))
+    except (OSError, ValueError, IndexError, AttributeError, subprocess.TimeoutExpired):
+        print("  Audio acquisition incomplete; original message history preserved")
+
+
 def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
                      lid_to_name, phone_to_name, idb_path_str, decrypted_dir_str,
                      runtime_store8_supplement=None):
@@ -2754,6 +2898,8 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
     runtime_store8_records = runtime_store8_supplement.get("records_by_msg_key", {})
     runtime_store8_summary = runtime_store8_supplement.get("summary", {})
     mention_batch = []
+    media_metadata_batch = []
+    audio_acquisition_since = audio_acquisition_cutoff()
     edit_markers = {}
     edit_events = {}
     _resolve_cache = {}
@@ -3176,6 +3322,8 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
         # encrypted msgRowOpaqueData; keep those rows but mark recovery clearly.
         idb_body, idb_body_status = select_indexeddb_message_body(msg_rec)
         runtime_match = runtime_store8_records.get(msg_key)
+        if msg_type in ("audio", "ptt") and ts >= audio_acquisition_since:
+            media_metadata_batch.append((*media_acquisition_metadata(msg_rec, runtime_match), msg_key, chat_jid))
         if not idb_body and runtime_match:
             runtime_body = runtime_supplement_text(runtime_match)
             if runtime_body:
@@ -3405,6 +3553,8 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
         if text:
             runtime_generic_coverage[(chat_jid, ts, message_identity_text(text))] += 1
         queue_mentions(msg_key, chat_jid, runtime_rec, "runtime")
+        if msg_type in ("audio", "ptt") and ts >= audio_acquisition_since:
+            media_metadata_batch.append((*media_acquisition_metadata(runtime_rec), msg_key, chat_jid))
         queue_edit_evidence(msg_key, chat_jid, stanza_id, sender_jid, runtime_rec, "runtime", text)
 
     if runtime_only_batch:
@@ -3415,6 +3565,13 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
             VALUES ('runtime_store8_only_inserted', ?)
         """, (str(len(runtime_only_batch)),))
     conn.commit()
+
+    if media_metadata_batch:
+        cursor.executemany("""
+            UPDATE messages SET media_filehash=?, media_enc_filehash=?, media_duration=?
+            WHERE msg_key=? AND chat_jid=?
+        """, [(m[0], m[1], m[5], m[6], m[7]) for m in media_metadata_batch])
+        conn.commit()
 
     if mention_batch:
         execute_many_counting(cursor, """
@@ -3972,6 +4129,8 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
     conn.commit()
     conn.close()
 
+    acquire_audio_from_private_metadata(output_path, media_metadata_batch)
+
     return {
         'messages': total_msgs,
         'enriched': enriched_msgs,
@@ -4027,12 +4186,13 @@ def _case_relative(path, case_root):
 
 
 def index_local_media_assets(db_path, case_root, enabled=True):
-    """Index local media files and link them to message rows by filename."""
+    """Link exact content hashes, or unambiguous legacy filenames, to messages."""
     db_path = pathlib.Path(db_path)
     case_root = pathlib.Path(case_root)
     conn = sqlite3.connect(str(db_path))
     try:
         conn.executescript(UNIFIED_SCHEMA)
+        ensure_media_acquisition_columns(conn)
         conn.execute(
             """
             UPDATE messages
@@ -4058,19 +4218,30 @@ def index_local_media_assets(db_path, case_root, enabled=True):
 
         message_rows = conn.execute(
             """
-            SELECT rowid, msg_key, chat_jid, media_filename, media_mime_type
+            SELECT rowid, msg_key, chat_jid, media_filename, media_mime_type,
+                   media_filehash, media_size
             FROM messages
-            WHERE media_filename IS NOT NULL AND TRIM(media_filename) <> ''
+            WHERE (media_filename IS NOT NULL AND TRIM(media_filename) <> '')
+               OR media_filehash IS NOT NULL
             """
         ).fetchall()
         by_filename = {}
-        for rowid, msg_key, chat_jid, filename, mime in message_rows:
-            by_filename.setdefault(str(filename).lower(), []).append({
+        by_hash = {}
+        for rowid, msg_key, chat_jid, filename, mime, filehash, size in message_rows:
+            digest = media_digest_bytes(filehash)
+            item = {
                 "rowid": rowid,
                 "msg_key": msg_key,
                 "chat_jid": chat_jid,
                 "mime": mime,
-            })
+                "expected_hash": digest.hex() if digest else None,
+                "has_expected_hash": filehash is not None,
+                "expected_size": size,
+            }
+            if filename:
+                by_filename.setdefault(str(filename).lower(), []).append(item)
+            if digest:
+                by_hash.setdefault(digest.hex(), []).append(item)
 
         # Dedup pass first (cheap: resolve() + set membership). We hash and
         # match after this so we never SHA-256 the same physical file twice.
@@ -4078,8 +4249,10 @@ def index_local_media_assets(db_path, case_root, enabled=True):
         seen_files = set()
         for file_path in iter_local_media_files(case_root):
             try:
-                resolved = str(file_path.resolve())
-            except OSError:
+                absolute = file_path.resolve()
+                absolute.relative_to(case_root.resolve())
+                resolved = str(absolute)
+            except (OSError, ValueError):
                 continue
             if resolved in seen_files:
                 continue
@@ -4116,12 +4289,26 @@ def index_local_media_assets(db_path, case_root, enabled=True):
         assets_linked = 0
         insert_rows = []
         update_rows = []
+        filename_contents = {}
+        for file_path, _, digest in hashed_entries:
+            filename_contents.setdefault(file_path.name.lower(), set()).add(digest)
         for file_path, size, digest in hashed_entries:
             files_indexed += 1
             filename = file_path.name
             rel = _case_relative(file_path, case_root)
             mime = mimetypes.guess_type(filename)[0]
-            matches = by_filename.get(filename.lower()) or [None]
+            # A content hash is authoritative even when voices have no filename.
+            # Never use a filename to override an expected content hash.
+            matches = list(by_hash.get(digest, []))
+            if not matches:
+                candidates = by_filename.get(filename.lower(), [])
+                identities = {(r["chat_jid"], r["msg_key"]) for r in candidates}
+                if len(identities) == 1 and len(filename_contents.get(filename.lower(), set())) == 1:
+                    matches = [r for r in candidates if not r["has_expected_hash"]]
+            matches = [r for r in matches if not r["expected_size"]
+                       or r["expected_size"] == size]
+            matches = [r for r in matches if r["msg_key"] and r["chat_jid"]]
+            matches = matches or [None]
             for match in matches:
                 insert_rows.append((
                     match.get("msg_key") if match else None,

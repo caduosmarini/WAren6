@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import waren6
@@ -992,6 +993,56 @@ class BodyStatusTests(unittest.TestCase):
 
 
 class MediaIndexTests(unittest.TestCase):
+    def _index_audio(self, messages, name="28", content=b"voice bytes"):
+        with tempfile.TemporaryDirectory() as tmp:
+            case_root = Path(tmp)
+            folder = case_root / "EBWebView_Default" / "IndexedDB" / "wa.indexeddb.blob"
+            folder.mkdir(parents=True)
+            (folder / name).write_bytes(content)
+            db_path = case_root / "unified_whatsapp.db"
+            conn = sqlite3.connect(db_path)
+            conn.executescript(waren6.UNIFIED_SCHEMA)
+            conn.executemany("""
+                INSERT INTO messages(msg_key, chat_jid, timestamp, msg_type,
+                    media_filename, media_mime_type, media_filehash, media_size)
+                VALUES (?, ?, 1, 'audio', ?, 'audio/ogg', ?, ?)
+            """, messages)
+            conn.commit()
+            conn.close()
+            report = waren6.index_local_media_assets(db_path, case_root)
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute("SELECT msg_key,media_case_path,media_sha256 FROM messages ORDER BY msg_key").fetchall()
+            conn.close()
+            return report, rows
+
+    def test_voice_without_filename_links_only_verified_content_hash(self):
+        digest = waren6.sha256_bytes(b"voice bytes")
+        report, rows = self._index_audio([("voice-id", "a@lid", None, digest, 11)])
+        self.assertEqual(report["messages_with_local_media"], 1)
+        self.assertEqual(rows[0][2], digest)
+        self.assertTrue(rows[0][1].endswith("28"))
+
+    def test_matching_filename_never_overrides_content_hash_or_size(self):
+        for expected_hash, size in ((waren6.sha256_bytes(b"other voice"), 11),
+                                    (waren6.sha256_bytes(b"voice bytes"), 200)):
+            with self.subTest(size=size):
+                report, rows = self._index_audio([("voice-id", "a@lid", "28", expected_hash, size)])
+                self.assertEqual(report["messages_with_local_media"], 0)
+                self.assertIsNone(rows[0][1])
+
+    def test_ambiguous_filename_without_hash_never_links(self):
+        report, rows = self._index_audio([("first", "a@lid", "28", None, 11),
+                                         ("second", "b@lid", "28", None, 11)])
+        self.assertEqual(report["messages_with_local_media"], 0)
+        self.assertTrue(all(row[1] is None for row in rows))
+
+    def test_forwarded_content_can_link_multiple_exact_message_hashes(self):
+        digest = waren6.sha256_bytes(b"voice bytes")
+        report, rows = self._index_audio([("first", "a@lid", None, digest, 11),
+                                         ("second", "b@lid", None, digest, 11)])
+        self.assertEqual(report["messages_with_local_media"], 2)
+        self.assertTrue(all(row[2] == digest for row in rows))
+
     def test_media_index_links_local_transfer_file_by_filename(self):
         with tempfile.TemporaryDirectory() as tmp:
             case_root = Path(tmp)
@@ -1029,6 +1080,144 @@ class MediaIndexTests(unittest.TestCase):
         self.assertEqual(row[0], "local_present")
         self.assertTrue(row[1].endswith("photo.jpg"))
         self.assertEqual(row[2], waren6.sha256_bytes(b"fake jpg"))
+
+
+class MediaAcquisitionMetadataTests(unittest.TestCase):
+    def test_backfill_epoch_selects_explicit_scope_and_invalid_values_keep_default(self):
+        now = 1791446400
+        with patch.dict(waren6.os.environ, {"WHATMCP_AUDIO_BACKFILL_AFTER": "1784766189"}):
+            self.assertEqual(waren6.audio_acquisition_cutoff(now), 1784766189)
+        for value in ("", "not-an-epoch", "0", "-1", str(now + 1)):
+            with self.subTest(value=value), patch.dict(waren6.os.environ, {"WHATMCP_AUDIO_BACKFILL_AFTER": value}):
+                self.assertEqual(waren6.audio_acquisition_cutoff(now), now - 7 * 86400)
+
+    def test_backfill_includes_audio_after_iphone_boundary_only(self):
+        import base64
+        cutoff = 1784766189
+        key = base64.b64encode(b"k" * 32).decode("ascii")
+        digest = waren6.sha256_bytes(b"voice bytes")
+        records = [
+            {"id": "false_a@lid_NEW", "t": cutoff + 1, "type": "audio", "filehash": digest, "mediaKey": key},
+            {"id": "false_a@lid_OLDER", "t": cutoff - 1, "type": "audio", "filehash": digest, "mediaKey": key},
+        ]
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(waren6.os.environ, {"WHATMCP_AUDIO_BACKFILL_AFTER": str(cutoff)}), \
+                patch.object(waren6, "acquire_audio_from_private_metadata") as acquisition:
+            db_path = str(Path(tmp) / "unified_whatsapp.db")
+            with contextlib.redirect_stdout(io.StringIO()):
+                waren6.build_unified_db(db_path, {"message": records}, [], {}, {}, {}, "indexeddb", "decrypted")
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute("SELECT msg_id,media_filehash,media_key FROM messages ORDER BY msg_id").fetchall()
+            conn.close()
+        self.assertEqual(rows, [("NEW", digest, None), ("OLDER", None, None)])
+        self.assertEqual(len(acquisition.call_args.args[1]), 1)
+        self.assertEqual(acquisition.call_args.args[1][0][6], "false_a@lid_NEW")
+
+    def test_persists_hashes_and_passes_keys_only_in_memory_by_exact_message(self):
+        import base64
+        digest = waren6.sha256_bytes(b"voice bytes")
+        b64_hash = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+        key = base64.b64encode(b"k" * 32).decode("ascii")
+        msg_key = "false_a@lid_EXACT"
+        record = {"id": msg_key, "t": int(waren6.time.time()), "type": "audio", "mimetype": "audio/ogg",
+                  "size": 11, "filehash": b64_hash, "encFilehash": b64_hash, "mediaKey": key,
+                  "directPath": "/audio/example.enc", "staticUrl": "https://mmg.whatsapp.net/audio/example.enc",
+                  "duration": 5}
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "unified_whatsapp.db")
+            with contextlib.redirect_stdout(io.StringIO()), patch.object(waren6, "acquire_audio_from_private_metadata") as acquisition:
+                waren6.build_unified_db(db_path, {"message": [record]}, [], {}, {}, {}, "indexeddb", "decrypted")
+            conn = sqlite3.connect(db_path)
+            row = conn.execute("SELECT media_filename,media_filehash,media_enc_filehash,media_key,media_direct_path,media_url,media_duration FROM messages WHERE msg_key=?", (msg_key,)).fetchone()
+            conn.close()
+        self.assertEqual(row, (None, digest, digest, None, None, None, 5))
+        self.assertEqual(acquisition.call_args.args[1][0],
+                         (digest, digest, key, record["directPath"], record["staticUrl"], 5, msg_key, "a@lid"))
+
+    def test_fixed_decoder_receives_pipe_metadata_and_logs_counters_only(self):
+        import json
+        from types import SimpleNamespace
+        metadata = [("hash", "encrypted-hash", "private-key", "/private-path", "private-url", 5,
+                     "false_a@lid_EXACT", "a@lid")]
+        output = io.StringIO()
+        response = SimpleNamespace(returncode=0, stderr="private-key", stdout=json.dumps(
+            {"downloaded": 1, "eligible": 1, "private_url": "private-url", "media_key": "private-key"}))
+        from unittest.mock import MagicMock
+        source = MagicMock()
+        source.execute.return_value.fetchall.return_value = [("EXACT", "a@lid")]
+        with patch.dict(waren6.os.environ, {"WHATMCP_AUDIO_ACQUISITION_ENABLED": "1"}), \
+                patch.object(waren6.pathlib.Path, "is_file", return_value=True), \
+                patch.object(waren6.pathlib.Path, "is_symlink", return_value=False), \
+                patch.object(waren6.sqlite3, "connect", return_value=source), \
+                patch.object(waren6.subprocess, "run", return_value=response) as run, \
+                contextlib.redirect_stdout(output):
+            waren6.acquire_audio_from_private_metadata("source.db", metadata)
+        command = run.call_args.args[0]
+        self.assertEqual(command[0].replace("\\", "/"), "C:/Program Files/nodejs/node.exe")
+        self.assertTrue(command[4].replace("\\", "/").endswith("/whatmcp/scripts/acquire-windows-audio.ts"))
+        self.assertEqual(command[5:], ["--source=source.db", "--metadata-stdin"])
+        self.assertEqual(json.loads(run.call_args.kwargs["input"])[0]["msg_id"], "EXACT")
+        self.assertEqual(json.loads(run.call_args.kwargs["input"])[0]["media_key"], "private-key")
+        self.assertNotIn("private-key", output.getvalue())
+        self.assertNotIn("private-url", output.getvalue())
+        self.assertIn('"downloaded": 1', output.getvalue())
+
+    def test_pipe_limits_recent_and_backfill_candidates_before_serializing_keys(self):
+        import json
+        from types import SimpleNamespace
+        now = int(waren6.time.time())
+        metadata = [("ab" * 32, None, "private-key", "/audio.enc", None, 5,
+                     f"false_a@lid_ID{i}", "a@lid") for i in range(2001)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "source.db"
+            conn = sqlite3.connect(path)
+            conn.executescript(waren6.UNIFIED_SCHEMA)
+            conn.executemany("""INSERT INTO messages(msg_id,chat_jid,timestamp,msg_type,media_filehash)
+                VALUES (?, 'a@lid', ?, 'audio', ?)""",
+                [(f"ID{i}", now, "ab" * 32) for i in range(2001)])
+            conn.commit()
+            conn.close()
+            for after, limit in (("", 200), (str(now - 90 * 86400), 2000)):
+                with self.subTest(limit=limit), \
+                        patch.dict(waren6.os.environ, {"WHATMCP_AUDIO_ACQUISITION_ENABLED": "1", "WHATMCP_AUDIO_BACKFILL_AFTER": after}), \
+                        patch.object(waren6.pathlib.Path, "is_file", return_value=True), \
+                        patch.object(waren6.pathlib.Path, "is_symlink", return_value=False), \
+                        patch.object(waren6.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout='{"eligible":0}', stderr="")) as run, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    waren6.acquire_audio_from_private_metadata(path, metadata)
+                payload = json.loads(run.call_args.kwargs["input"])
+                self.assertEqual(len(payload), limit)
+                self.assertEqual(payload[0]["msg_id"], "ID2000")
+                self.assertEqual(payload[-1]["msg_id"], f"ID{2001-limit}")
+            conn = sqlite3.connect(path)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages WHERE media_key IS NOT NULL").fetchone()[0], 0)
+            conn.close()
+
+    def test_acquisition_secrets_are_not_retained_for_images_or_old_audio(self):
+        import base64
+        key = base64.b64encode(b"k" * 32).decode("ascii")
+        records = [
+            {"id": "false_a@lid_IMAGE", "t": int(waren6.time.time()), "type": "image", "mediaKey": key},
+            {"id": "false_a@lid_OLD", "t": 10, "type": "audio", "mediaKey": key},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "unified_whatsapp.db")
+            with contextlib.redirect_stdout(io.StringIO()):
+                waren6.build_unified_db(db_path, {"message": records}, [], {}, {}, {}, "indexeddb", "decrypted")
+            conn = sqlite3.connect(db_path)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages WHERE media_key IS NOT NULL OR media_url IS NOT NULL").fetchone()[0], 0)
+            conn.close()
+
+    def test_runtime_supplement_metadata_fills_missing_store8_metadata(self):
+        import base64
+        digest = waren6.sha256_bytes(b"voice bytes")
+        key = base64.b64encode(b"k" * 32).decode("ascii")
+        metadata = waren6.media_acquisition_metadata({"filehash": None},
+            {"filehash": digest, "media_key": key, "direct_path": "/audio/example.enc", "media_size": 11})
+        self.assertEqual(metadata[0], digest)
+        self.assertEqual(metadata[2], key)
+        self.assertEqual(metadata[3], "/audio/example.enc")
+        self.assertIsNone(waren6.media_digest_bytes("invalid hash"))
 
 
 class UnifyPathTests(unittest.TestCase):
