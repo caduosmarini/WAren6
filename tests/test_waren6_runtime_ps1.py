@@ -1,5 +1,8 @@
 import pathlib
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 
@@ -10,6 +13,107 @@ SCRIPT = ROOT / "waren6.ps1"
 class PowerShellRuntimeCaptureTests(unittest.TestCase):
     def _source(self):
         return SCRIPT.read_text(encoding="utf-8", errors="replace")
+
+    def test_runtime_only_passes_writable_diagnostics_reference(self):
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell:
+            self.skipTest("PowerShell is required for the parameter binding regression")
+        source = self._source()
+        branch_start = source.rindex("elseif ($RuntimeOnly) {")
+        branch_end = source.index("elseif ($PSBoundParameters.ContainsKey('GetID'))", branch_start)
+        branch = source[branch_start:branch_end]
+        call = re.search(r"^\s*\$runtimePath = Invoke-WAren6RuntimeStore8Capture[^\r\n]+", branch, re.M).group(0)
+        initialize = re.search(r"^\s*\$runtimeCaptureDiagnostics = \$null", branch, re.M)
+        self.assertIsNotNone(initialize)
+        # Execute the real RuntimeOnly call with a harmless mock using the
+        # capture function's [ref] contract. No app launch or process changes.
+        probe = r"""
+$ErrorActionPreference = 'Stop'
+function Invoke-WAren6RuntimeStore8Capture {
+    param([string]$OutputDirectory, [switch]$Silent, [switch]$BlockClose,
+          [switch]$DeepRuntime, [ref]$Diagnostics = $null)
+    if ($null -eq $Diagnostics) { throw 'diagnostics reference missing' }
+    $Diagnostics.Value = @{ status = 'mock_capture_reached' }
+    return 'mock-runtime.jsonl'
+}
+$CasePath = 'mock-output'
+$runtimeHidden = $true
+$ForegroundRuntime = $false
+$DeepRuntime = $false
+""" + initialize.group(0) + "\n" + call + r"""
+if ($runtimePath -ne 'mock-runtime.jsonl') { throw 'capture result lost' }
+if ($runtimeCaptureDiagnostics.status -ne 'mock_capture_reached') { throw 'diagnostics output lost' }
+Write-Output 'runtime-only-binding-ok'
+"""
+        result = subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-Command", probe],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("runtime-only-binding-ok", result.stdout)
+
+    def test_registry_denial_falls_back_and_cleans_up_after_capture_failure(self):
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell:
+            self.skipTest("PowerShell is required for runtime cleanup regression")
+        source = self._source()
+        start = source.index("function Invoke-WAren6RuntimeStore8Capture {")
+        end = source.index("function Test-WAren6RuntimeJsonl", start)
+        capture = source[start:end]
+        probe = r"""
+$ErrorActionPreference = 'Stop'
+$script:events = @()
+$script:running = $false
+[Environment]::SetEnvironmentVariable('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', 'previous-value', 'Process')
+function Test-Path { param($Path) return $false }
+function New-Item {
+    param($Path, $ItemType, [switch]$Force, $ErrorAction)
+    if ($Path -like 'HKCU:*') { throw 'mock registry permission denied' }
+}
+function Get-Process {
+    param($Name, $ErrorAction)
+    if ($script:running) { [PSCustomObject]@{ Id = 123 } }
+}
+function Stop-Process {
+    param([Parameter(ValueFromPipeline=$true)]$InputObject, [switch]$Force)
+    process { $script:running = $false; $script:events += 'stopped' }
+}
+function Invoke-WAren6WhatsAppRuntimeLaunch {
+    param([switch]$Silent, [switch]$ProcessArguments)
+    if ($ProcessArguments) {
+        if ($env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS -notmatch '--remote-debugging-port=9222') { throw 'fallback arguments missing' }
+        $script:running = $true
+        $script:events += 'fallback'
+    }
+    else {
+        if ($env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS -ne 'previous-value') { throw 'process environment not restored' }
+        $script:events += 'normal'
+    }
+}
+function Wait-WAren6DevToolsPage {
+    param($Port, $ReadinessBudgetSeconds, $ProbeTimeoutMilliseconds, $PollMilliseconds, $MaintenanceAction)
+    return [PSCustomObject]@{ status = 'endpoint_timeout'; page = $null }
+}
+""" + capture + r"""
+$diagnostics = $null
+$failedAsExpected = $false
+try { Invoke-WAren6RuntimeStore8Capture -OutputDirectory 'mock-output' -Silent -Diagnostics ([ref]$diagnostics) }
+catch { $failedAsExpected = $_.Exception.Message -match 'endpoint_timeout'; if (-not $failedAsExpected) { throw } }
+if (-not $failedAsExpected) { throw 'expected capture failure was lost' }
+if (($script:events -join ',') -ne 'fallback,stopped,normal') { throw 'debug process cleanup and normal relaunch failed' }
+if ($diagnostics.status -ne 'endpoint_timeout') { throw 'readiness diagnostics lost' }
+if ($env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS -ne 'previous-value') { throw 'environment restoration failed' }
+Write-Output 'fallback-cleanup-ok'
+"""
+        # Only the capture function is loaded; every process/registry operation
+        # is mocked, and readiness fails before any WebSocket can be opened.
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [shell, "-NoProfile", "-NonInteractive", "-Command", probe],
+                cwd=directory, capture_output=True, text=True, timeout=30,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fallback-cleanup-ok", result.stdout)
 
     def _runtime_expression(self):
         source = self._source()
