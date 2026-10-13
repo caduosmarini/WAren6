@@ -3249,7 +3249,9 @@ function Enable-WAren6WhatsAppClose {
 function Invoke-WAren6WhatsAppRuntimeLaunch {
     param(
         [Parameter(Mandatory = $false)]
-        [switch]$Silent
+        [switch]$Silent,
+        [Parameter(Mandatory = $false)]
+        [switch]$ProcessArguments
     )
 
     $appId = if ($global:WhatsAppPackageFamilyName) {
@@ -3259,7 +3261,21 @@ function Invoke-WAren6WhatsAppRuntimeLaunch {
         "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"
     }
 
-    Start-Process "explorer.exe" "shell:AppsFolder\$appId" -WindowStyle Hidden | Out-Null
+    if ($ProcessArguments) {
+        # Direct launch inherits the caller's process-only WebView2 environment.
+        $package = Get-AppxPackage -Name "5319275A.WhatsAppDesktop" -ErrorAction Stop | Select-Object -First 1
+        if (-not $package -or -not $package.InstallLocation) {
+            throw "WhatsApp package was not found for process-only runtime launch."
+        }
+        $executable = Join-Path $package.InstallLocation "WhatsApp.Root.exe"
+        if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+            throw "WhatsApp runtime executable was not found in its installed package."
+        }
+        Start-Process -FilePath $executable -WindowStyle Hidden -ErrorAction Stop | Out-Null
+    }
+    else {
+        Start-Process "explorer.exe" "shell:AppsFolder\$appId" -WindowStyle Hidden | Out-Null
+    }
     if ($Silent) {
         Hide-WAren6WhatsAppWindows
         Start-Sleep -Milliseconds 500
@@ -3605,19 +3621,34 @@ function Invoke-WAren6RuntimeStore8Capture {
     $valueName = "WhatsApp.Root.exe"
     $oldValue = $null
     $hadOldValue = $false
+    $registryConfigured = $false
+    $processArguments = $false
+    $fallbackLaunchAttempted = $false
+    $oldProcessArguments = [Environment]::GetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "Process")
+    $debugArguments = "--remote-debugging-port=$Port --remote-debugging-address=127.0.0.1"
 
     try {
-        if (Test-Path $regPath) {
-            $props = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
-            if ($props.PSObject.Properties.Name -contains $valueName) {
-                $hadOldValue = $true
-                $oldValue = $props.$valueName
+        try {
+            if (Test-Path $regPath) {
+                $props = Get-ItemProperty -Path $regPath -ErrorAction Stop
+                if ($props.PSObject.Properties.Name -contains $valueName) {
+                    $hadOldValue = $true
+                    $oldValue = $props.$valueName
+                }
             }
+            else {
+                New-Item -Path $regPath -Force -ErrorAction Stop | Out-Null
+            }
+            Set-ItemProperty -Path $regPath -Name $valueName -Value $debugArguments -Type String -ErrorAction Stop
+            $registryConfigured = $true
         }
-        else {
-            New-Item -Path $regPath -Force | Out-Null
+        catch {
+            Write-Warning "WebView2 policy setup unavailable; using temporary process arguments: $($_.Exception.Message)"
+            # Microsoft documents this process environment variable for debugging:
+            # https://learn.microsoft.com/en-us/microsoft-edge/webview2/how-to/debug-visual-studio-code
+            [Environment]::SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", $debugArguments, "Process")
+            $processArguments = $true
         }
-        Set-ItemProperty -Path $regPath -Name $valueName -Value "--remote-debugging-port=$Port --remote-debugging-address=127.0.0.1" -Type String
 
         $running = Get-Process -Name "*WhatsApp*" -ErrorAction SilentlyContinue
         if ($running) {
@@ -3638,7 +3669,8 @@ function Invoke-WAren6RuntimeStore8Capture {
             }
         }
 
-        Invoke-WAren6WhatsAppRuntimeLaunch -Silent:$Silent
+        $fallbackLaunchAttempted = $processArguments
+        Invoke-WAren6WhatsAppRuntimeLaunch -Silent:$Silent -ProcessArguments:$processArguments
         if ($BlockClose -and -not $Silent) {
             Disable-WAren6WhatsAppClose
         }
@@ -3760,11 +3792,27 @@ function Invoke-WAren6RuntimeStore8Capture {
         if ($BlockClose -and -not $Silent) {
             Enable-WAren6WhatsAppClose
         }
-        if ($hadOldValue) {
-            Set-ItemProperty -Path $regPath -Name $valueName -Value $oldValue -Type String
+        [Environment]::SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", $oldProcessArguments, "Process")
+        if ($registryConfigured) {
+            if ($hadOldValue) {
+                Set-ItemProperty -Path $regPath -Name $valueName -Value $oldValue -Type String
+            }
+            else {
+                Remove-ItemProperty -Path $regPath -Name $valueName -ErrorAction SilentlyContinue
+            }
         }
-        else {
-            Remove-ItemProperty -Path $regPath -Name $valueName -ErrorAction SilentlyContinue
+        if ($fallbackLaunchAttempted) {
+            # Environment restoration alone cannot remove debugging from an
+            # already running WebView2 process, including a failed capture.
+            Get-Process -Name "*WhatsApp*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction Stop
+            $cleanupWatch = [System.Diagnostics.Stopwatch]::StartNew()
+            while ((Get-Process -Name "*WhatsApp*" -ErrorAction SilentlyContinue) -and ($cleanupWatch.ElapsedMilliseconds -lt 5000)) {
+                Start-Sleep -Milliseconds 250
+            }
+            if (Get-Process -Name "*WhatsApp*" -ErrorAction SilentlyContinue) {
+                throw "WhatsApp debug process exit timeout during runtime cleanup."
+            }
+            Invoke-WAren6WhatsAppRuntimeLaunch -Silent:$Silent
         }
     }
 }
@@ -5585,7 +5633,8 @@ elseif ($RuntimeOnly) {
     New-Item -ItemType Directory -Force -Path $CasePath | Out-Null
     try {
         $runtimeHidden = -not $ForegroundRuntime
-        $runtimePath = Invoke-WAren6RuntimeStore8Capture -OutputDirectory $CasePath -Silent:$runtimeHidden -BlockClose:$ForegroundRuntime -DeepRuntime:$DeepRuntime
+        $runtimeCaptureDiagnostics = $null
+        $runtimePath = Invoke-WAren6RuntimeStore8Capture -OutputDirectory $CasePath -Silent:$runtimeHidden -BlockClose:$ForegroundRuntime -DeepRuntime:$DeepRuntime -Diagnostics ([ref]$runtimeCaptureDiagnostics)
         Write-WAren6Output "Runtime Store 8 JSONL: $runtimePath"
         exit 0
     }
